@@ -1,4 +1,4 @@
-﻿#include "web_handler.h"
+#include "web_handler.h"
 #include <Update.h>
 #include <SD.h>
 
@@ -242,7 +242,7 @@ static String accessLabel(const User &u)
 
 // Parses "YYYY-MM-DDTHH:MM" (from <input type='datetime-local'>) into seconds
 // since 1970, treating the fields as literal RTC date/time (no time zone).
-static bool parseDateTimeLocal(const String &s, uint32_t &ts)
+bool parseDateTimeLocal(const String &s, uint32_t &ts)
 {
   if (s.length() < 16 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != ' ') || s[13] != ':')
     return false;
@@ -836,6 +836,24 @@ static bool validSdName(const String &n)
   return true;
 }
 
+// A file in the SD root ("name") or inside a month folder ("YYYY-MM/name").
+// The event logs live in month folders; nothing deeper is allowed.
+static bool validSdPath(const String &n)
+{
+  int sl = n.indexOf('/');
+  if (sl < 0)
+    return validSdName(n);
+  return validMonthStr(n.substring(0, sl)) && n.indexOf('/', sl + 1) < 0 && validSdName(n.substring(sl + 1));
+}
+
+// Files-tab URL that shows the folder holding `name` ("YYYY-MM/x.log" -> that
+// month's folder; a root file -> the root listing).
+static String filesTabUrl(const String &name)
+{
+  int sl = name.indexOf('/');
+  return (sl > 0) ? "/?tab=files&dir=" + name.substring(0, sl) : String("/?tab=files");
+}
+
 // SD.open() throws std::bad_alloc when heap is low (see logEvent()); a failed
 // open must degrade to "can't open", never abort the controller.
 static bool sdOpen(const String &path, const char *mode, File &f)
@@ -1349,7 +1367,7 @@ static void handleRoot()
     html += "<div class='section-sub'>Upload a new firmware (.bin) image to update this device over the network.</div>";
     html += "<div class='card'>";
     html += "<div class='form-group'><label>Current firmware version</label><div><strong>" FIRMWARE_VERSION "</strong></div></div>";
-    html += "<div class='alert alert-danger' style='margin-bottom:16px;'>&#9888; All outputs (including any active hoist/motion output) will be forced OFF and E-STOP latched the instant the upload starts. The device will restart automatically once the update finishes. Do not close this page, remove power, or leave the machine unattended until it reconnects.</div>";
+    html += "<div class='alert alert-danger' style='margin-bottom:16px;'>&#9888; All outputs (including any active motion output) will be forced OFF and E-STOP latched the instant the upload starts. The device will restart automatically once the update finishes. Do not close this page, remove power, or leave the machine unattended until it reconnects.</div>";
     html += "<form id='ota-form' method='POST' action='/ota' enctype='multipart/form-data'>";
     html += "<div class='form-group'><label>Firmware file (.bin)</label>";
     html += "<input type='file' name='firmware' accept='.bin' required></div>";
@@ -1381,19 +1399,31 @@ static void handleRoot()
   {
     html += "<div id='tab-files' class='tab-panel active'>";
     html += "<div class='section-title'>&#128193; Files</div>";
-    html += "<div class='section-sub'>Files on the SD card. Event logs are saved one file per month (events_YYYY-MM.log).</div>";
+    // dir=YYYY-MM shows the inside of a month folder; otherwise the SD root.
+    String curDir = webServer.hasArg("dir") ? webServer.arg("dir") : String("");
+    if (!validMonthStr(curDir))
+      curDir = "";
+    html += "<div class='section-sub'>Files on the SD card. Event logs are saved in one folder per month (YYYY-MM), one file per day (YYYY-MM-DD.log).</div>";
+    if (curDir.length() > 0)
+    {
+      html += "<div style='margin-bottom:14px;'><a href='/?tab=files' class='btn btn-outline'>&#8592; All files</a> "
+              "<span class='badge'>&#128193; " + curDir + "</span></div>";
+    }
 
-    // Create-new-file form
+    // Create-new-file form (SD root only)
+    if (curDir.length() == 0)
+    {
     html += "<div class='card' style='margin-bottom:16px;'>";
     html += "<form method='POST' action='/files/new' style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0;'>";
     html += "<input type='text' name='name' placeholder='New file name, e.g. notes.txt' required maxlength='60' "
             "style='flex:1;min-width:220px;padding:9px 12px;border:1px solid #E2E8F0;border-radius:7px;'>";
     html += "<button type='submit' class='btn btn-primary'>&#43; Create File</button>";
     html += "</form></div>";
+    }
     mayFlush();
 
     File root;
-    if (!sdOpen("/", FILE_READ, root) || !root.isDirectory())
+    if (!sdOpen("/" + curDir, FILE_READ, root) || !root.isDirectory())
     {
       html += "<div class='alert alert-danger'>&#9888; SD card not available. Check that the card is inserted.</div>";
     }
@@ -1407,12 +1437,30 @@ static void handleRoot()
       File e = root.openNextFile();
       while (e && rows < 100 && !clientDead)
       {
-        if (!e.isDirectory())
+        if (e.isDirectory())
+        {
+          // Month folders (YYYY-MM) in the root are listed as openable folders.
+          String dn = e.name();
+          int dsl = dn.lastIndexOf('/');
+          if (dsl >= 0)
+            dn = dn.substring(dsl + 1);
+          if (curDir.length() == 0 && validMonthStr(dn))
+          {
+            rows++;
+            html += "<tr><td>" + String(rows) + "</td>";
+            html += "<td>&#128193; <a href='/?tab=files&dir=" + dn + "'>" + dn + "</a></td>";
+            html += "<td>&mdash;</td><td>&mdash;</td>";
+            html += "<td><a href='/?tab=files&dir=" + dn + "' class='btn btn-outline'>Open folder</a></td></tr>";
+            mayFlush();
+          }
+        }
+        else
         {
           String nm = e.name();
           int sl = nm.lastIndexOf('/');
           if (sl >= 0)
             nm = nm.substring(sl + 1);
+          String pathName = curDir.length() > 0 ? curDir + "/" + nm : nm; // name as used by /files/* routes
           long entries = countEntries(e, countDeadline);
           rows++;
           html += "<tr><td>" + String(rows) + "</td>";
@@ -1422,7 +1470,7 @@ static void handleRoot()
           html += "<td>";
           if (validSdName(nm))
           {
-            String q = urlEnc(nm);
+            String q = urlEnc(pathName);
             html += "<a href='/files/download?name=" + q + "' class='btn btn-outline'>&#11015; Download</a>&nbsp;";
             html += "<a href='/files/edit?name=" + q + "' class='btn btn-edit'>&#9998; View / Edit</a>&nbsp;";
             html += "<a href='/files/confirm-delete?name=" + q + "' class='btn btn-danger'>Delete</a>";
@@ -1645,7 +1693,7 @@ static void handleRoot()
     bool savedOk = webServer.hasArg("saved");
     html += "<div id='tab-inconfig' class='tab-panel active'>";
     html += "<div class='section-title'>&#128225; Input Configuration</div>";
-    html += "<div class='section-sub'>I0.7 and I0.8 share their pin with A0.7/A0.8 — choose digital or analog mode for each, then assign inputs to the configured hoist(s) or the mobile remote control.</div>";
+    html += "<div class='section-sub'>I0.7 and I0.8 share their pin with A0.7/A0.8 — choose digital or analog mode for each, then assign the input used for the mobile remote control.</div>";
     if (savedOk)
     {
       html += "<div class='alert alert-info'>&#10003; Input configuration saved.</div>";
@@ -1682,42 +1730,6 @@ static void handleRoot()
     html += "</tbody></table>";
     html += "</div>"; // end card
 
-    bool wantHoist1 = (hoistConfig == HOIST_ONE || hoistConfig == HOIST_BOTH);
-    bool wantHoist2 = (hoistConfig == HOIST_TWO || hoistConfig == HOIST_BOTH);
-    if (wantHoist1 || wantHoist2)
-    {
-      html += "<div class='card' style='margin-top:20px;'>";
-      html += "<div class='section-title' style='font-size:17px;'>Hoist Input Mapping</div>";
-      if (wantHoist1)
-      {
-        html += "<div class='form-group'><label>Hoist 1 Input</label>";
-        html += "<select name='hoist1_input' class='oc-select'>";
-        html += "<option value='-1'" + String(hoistOneInputIdx == -1 ? " selected" : "") + ">&#8212; None &#8212;</option>";
-        for (int i = 0; i < NUM_INPUT_PINS; i++)
-        {
-          if (!INPUT_PINS[i].switchable) continue;
-          html += "<option value='" + String(i) + "'" + String(hoistOneInputIdx == i ? " selected" : "") + ">" + String(getInputLabel(i)) + "</option>";
-        }
-        html += "</select></div>";
-      }
-      if (wantHoist2)
-      {
-        html += "<div class='form-group'><label>Hoist 2 Input</label>";
-        html += "<select name='hoist2_input' class='oc-select'>";
-        html += "<option value='-1'" + String(hoistTwoInputIdx == -1 ? " selected" : "") + ">&#8212; None &#8212;</option>";
-        for (int i = 0; i < NUM_INPUT_PINS; i++)
-        {
-          if (!INPUT_PINS[i].switchable) continue;
-          html += "<option value='" + String(i) + "'" + String(hoistTwoInputIdx == i ? " selected" : "") + ">" + String(getInputLabel(i)) + "</option>";
-        }
-        html += "</select></div>";
-      }
-      html += "</div>";
-    }
-    else
-    {
-      html += "<div class='alert alert-info' style='margin-top:20px;'>No hoist configured.</div>";
-    }
 
     html += "<div class='form-actions' style='margin-top:18px;'>";
     html += "<button type='submit' class='btn btn-primary'>&#10003; Save Input Configuration</button>";
@@ -2445,7 +2457,7 @@ static void handleTimeConfigPost()
 }
 
 // ============================================================
-//  Input Configuration POST — I0.7/I0.8 mode + hoist input mapping
+//  Input Configuration POST — I0.7/I0.8 mode + remote-control input
 // ============================================================
 static void handleInConfigPost()
 {
@@ -2461,24 +2473,6 @@ static void handleInConfigPost()
     int m = webServer.arg(paramName).toInt();
     inputMode[i] = (m == INPUT_MODE_ANALOG) ? INPUT_MODE_ANALOG : INPUT_MODE_DIGITAL;
   }
-
-  bool wantHoist1 = (hoistConfig == HOIST_ONE || hoistConfig == HOIST_BOTH);
-  bool wantHoist2 = (hoistConfig == HOIST_TWO || hoistConfig == HOIST_BOTH);
-
-  int8_t newHoist1 = -1;
-  int8_t newHoist2 = -1;
-  if (wantHoist1)
-  {
-    int v = webServer.arg("hoist1_input").toInt();
-    newHoist1 = (v >= 0 && v < NUM_INPUT_PINS) ? (int8_t)v : -1;
-  }
-  if (wantHoist2)
-  {
-    int v = webServer.arg("hoist2_input").toInt();
-    newHoist2 = (v >= 0 && v < NUM_INPUT_PINS) ? (int8_t)v : -1;
-  }
-  hoistOneInputIdx = newHoist1;
-  hoistTwoInputIdx = newHoist2;
 
   int8_t newRemote = -1;
   for (int i = 0; i < NUM_INPUT_PINS; i++)
@@ -2682,9 +2676,9 @@ static void handleFileDownload()
     return;
   String name = webServer.arg("name");
   File f;
-  if (!validSdName(name) || !sdOpen("/" + name, FILE_READ, f) || f.isDirectory())
+  if (!validSdPath(name) || !sdOpen("/" + name, FILE_READ, f) || f.isDirectory())
   {
-    sendSafe(404, "text/html", errorPage("File not found.", "/?tab=files"));
+    sendSafe(404, "text/html", errorPage("File not found.", filesTabUrl(name).c_str()));
     return;
   }
   // Phone browsers (Android Chrome / iOS Safari) are stricter than desktop ones:
@@ -2712,9 +2706,9 @@ static void handleFileEditGet()
     return;
   String name = webServer.arg("name");
   File f;
-  if (!validSdName(name) || !sdOpen("/" + name, FILE_READ, f) || f.isDirectory())
+  if (!validSdPath(name) || !sdOpen("/" + name, FILE_READ, f) || f.isDirectory())
   {
-    sendSafe(404, "text/html", errorPage("File not found.", "/?tab=files"));
+    sendSafe(404, "text/html", errorPage("File not found.", filesTabUrl(name).c_str()));
     return;
   }
   size_t size = f.size();
@@ -2781,7 +2775,7 @@ static void handleFileEditGet()
   if (editable)
     tail += "<button type='submit' class='btn btn-primary'>&#10003; Save Changes</button>";
   tail += "<a href='/files/download?name=" + urlEnc(name) + "' class='btn btn-outline'>&#11015; Download</a>";
-  tail += "<a href='/?tab=files' class='btn btn-cancel'>&#8592; Back</a>";
+  tail += "<a href='" + filesTabUrl(name) + "' class='btn btn-cancel'>&#8592; Back</a>";
   tail += "</div>";
   tail += editable ? "</form></div>" : "</div>";
   tail += pageFoot();
@@ -2795,27 +2789,27 @@ static void handleFileSavePost()
     return;
   String name = webServer.arg("name");
   String content = webServer.arg("content");
-  if (!validSdName(name))
+  if (!validSdPath(name))
   {
-    sendSafe(400, "text/html", errorPage("Invalid file name.", "/?tab=files"));
+    sendSafe(400, "text/html", errorPage("Invalid file name.", filesTabUrl(name).c_str()));
     return;
   }
   if (content.length() > FILE_EDIT_MAX_BYTES)
   {
-    sendSafe(400, "text/html", errorPage("Content too large to save (limit " + formatSize(FILE_EDIT_MAX_BYTES) + ").", "/?tab=files"));
+    sendSafe(400, "text/html", errorPage("Content too large to save (limit " + formatSize(FILE_EDIT_MAX_BYTES) + ").", filesTabUrl(name).c_str()));
     return;
   }
   content.replace("\r", ""); // browsers submit textarea line breaks as CRLF
   File f;
   if (!sdOpen("/" + name, FILE_WRITE, f)) // FILE_WRITE truncates, i.e. replaces the file
   {
-    sendSafe(500, "text/html", errorPage("Could not write the file. Check the SD card.", "/?tab=files"));
+    sendSafe(500, "text/html", errorPage("Could not write the file. Check the SD card.", filesTabUrl(name).c_str()));
     return;
   }
   f.print(content);
   f.close();
   Serial.printf("Web: file saved — %s (%u bytes)\n", name.c_str(), (unsigned)content.length());
-  webServer.sendHeader("Location", "/?tab=files");
+  webServer.sendHeader("Location", filesTabUrl(name).c_str());
   sendSafe(303);
 }
 
@@ -2824,9 +2818,9 @@ static void handleFileConfirmDelete()
   if (!webAuthAdmin())
     return;
   String name = webServer.arg("name");
-  if (!validSdName(name) || !SD.exists("/" + name))
+  if (!validSdPath(name) || !SD.exists("/" + name))
   {
-    sendSafe(404, "text/html", errorPage("File not found.", "/?tab=files"));
+    sendSafe(404, "text/html", errorPage("File not found.", filesTabUrl(name).c_str()));
     return;
   }
   String html = pageHead("Delete File", "This action cannot be undone");
@@ -2838,7 +2832,7 @@ static void handleFileConfirmDelete()
   html += "<input type='hidden' name='name' value='" + htmlEsc(name) + "'>";
   html += "<div class='del-btns'>";
   html += "<button type='submit' class='btn btn-danger'>Yes, Delete</button>";
-  html += "<a href='/?tab=files' class='btn btn-cancel'>Cancel</a>";
+  html += "<a href='" + filesTabUrl(name) + "' class='btn btn-cancel'>Cancel</a>";
   html += "</div></form></div></div>";
   html += pageFoot();
   sendSafe(200, "text/html", html);
@@ -2849,13 +2843,13 @@ static void handleFileDeletePost()
   if (!webAuthAdmin())
     return;
   String name = webServer.arg("name");
-  if (!validSdName(name) || !SD.remove("/" + name))
+  if (!validSdPath(name) || !SD.remove("/" + name))
   {
-    sendSafe(404, "text/html", errorPage("Could not delete the file.", "/?tab=files"));
+    sendSafe(404, "text/html", errorPage("Could not delete the file.", filesTabUrl(name).c_str()));
     return;
   }
   Serial.printf("Web: file deleted — %s\n", name.c_str());
-  webServer.sendHeader("Location", "/?tab=files");
+  webServer.sendHeader("Location", filesTabUrl(name).c_str());
   sendSafe(303);
 }
 

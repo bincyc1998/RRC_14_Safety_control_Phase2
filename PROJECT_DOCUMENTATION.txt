@@ -26,9 +26,9 @@ TABLE OF CONTENTS
  5. Bluetooth LE interface (service, characteristics, data flow)
  6. BLE security (AES-GCM encryption, replay protection)
  7. BLE authentication sequence
- 8. Command / status / heartbeat / analog data formats
+ 8. Command / status / heartbeat data formats
  9. Input and output configuration
-10. Hoist (analog) handling
+10. (removed - hoist handling)
 11. User management and access control
 12. Device registry
 13. Wi-Fi access point and web panel
@@ -64,14 +64,14 @@ PLC drives its physical outputs only while:
 At the same time the PLC runs its own Wi-Fi access point and a password
 protected web panel ("INTELLI RRC") used to:
    - manage users, registered phones, timed access,
-   - configure outputs / inputs / hoists,
+   - configure outputs / inputs,
    - change Wi-Fi and BLE names,
    - set the clock, browse/edit the SD event logs,
    - update the firmware over the air.
 
 Main features
-   * BLE GATT server with 5 characteristics (command, auth, status,
-     heartbeat, analog/hoist).
+   * BLE GATT server with 4 characteristics (command, auth, status,
+     heartbeat).
    * All BLE traffic after the handshake is AES-128-GCM encrypted, with
      per-session counters to block replay attacks.
    * Multi-condition fail-safe E-STOP (app command, physical input I0.1,
@@ -79,8 +79,8 @@ Main features
    * Up to 10 users (Admin / Operator), Perpetual or Timed access windows.
    * Up to 20 registered mobile devices (device whitelist).
    * Fully configurable output mapping (5 outputs -> DF1..DF5 -> motion).
-   * Configurable inputs (I0.7 / I0.8 digital or analog), up to 2 hoist
-     analog channels, configurable E-STOP interlock input.
+   * Configurable inputs (I0.7 / I0.8 digital or analog),
+     configurable E-STOP interlock input.
    * Battery-backed RTC (DS3231M) for timestamps and timed access.
    * SD card monthly CSV event log (login, logout, crane start/stop).
    * OTA firmware update from the browser with rollback-safe dual partitions.
@@ -137,7 +137,7 @@ Main features
 ================================================================================
  Tasks / contexts
    - Arduino loop() task : safety loop, web server handleClient(), SD logging,
-                           RTC resync, hoist reading.
+                           RTC resync.
    - BLE (Bluedroid) task: runs the GATT callbacks (onConnect, onDisconnect,
                            AuthCallbacks, DigitalCallbacks, HeartbeatCallbacks).
    - Wi-Fi / lwIP tasks  : handled by the SDK.
@@ -164,8 +164,7 @@ Main features
    deviceConnected / authenticated / connectedUserEmail / connId
    lastHeartbeatTime / heartbeatAlive / heartbeatMissCount
    users[], userCount, devices[], deviceCount
-   pinMotionConfig[], inputMode[], hoistConfig, hoistOneInputIdx,
-   hoistTwoInputIdx, remoteInputIdx
+   pinMotionConfig[], inputMode[], remoteInputIdx
    bleName, wifiSsid, wifiPassword
 
 
@@ -256,7 +255,6 @@ Main features
  +---------------+----------------------------------------+-----------------+
  | Name          | UUID                                   | Properties      |
  +---------------+----------------------------------------+-----------------+
- | ANALOG        | 6e400002-b5a3-f393-e0a9-e50e24dcca9e   | NOTIFY          |
  | DIGITAL       | 6e400003-b5a3-f393-e0a9-e50e24dcca9e   | WRITE (no resp) |
  | AUTH          | 6e400004-b5a3-f393-e0a9-e50e24dcca9e   | WRITE + NOTIFY  |
  | STATUS        | 6e400005-b5a3-f393-e0a9-e50e24dcca9e   | NOTIFY          |
@@ -307,15 +305,89 @@ Main features
    The app treats every status notification as an encrypted frame
    (IV|CIPHER|TAG, min 28 bytes).
 
- 5.5 ANALOG characteristic (…0002…)  - Notify
-   Purpose: hoist (analog) values to the app.
-   PLC -> App: encrypted text "H1,<val>" / "H2,<val>" /
-        "H1,<val>,H2,<val>" depending on hoist mode.
-   Function notifyHoistValues() exists and implements this, BUT its call
-   inside printHoistValues() is currently commented out ("//notifyHoistValues();"),
-   so at present hoist values are only printed on the Serial monitor and are
-   not transmitted to the app. Re-enabling that call activates the
-   characteristic.
+ (The former ANALOG characteristic 6e400002-... was removed.)
+
+
+ 5.6 USER MANAGEMENT service (add user from the mobile app)
+   Service UUID  : 6e400010-b5a3-f393-e0a9-e50e24dcca9e   (not advertised;
+                   discovered after connecting)
+   Characteristic: 6e400011-b5a3-f393-e0a9-e50e24dcca9e   WRITE + NOTIFY
+   Same AES-GCM packet format, key and replay counters as the other
+   characteristics. Only accepted from a logged-in app.
+
+   App -> PLC (plaintext before encryption):
+        ADD_USER|reqId|name|email|password|role|access|from|to
+          reqId    1-9 digits, echoed in the reply
+          name     1-32 chars          email  1-40 chars, must contain '@'
+          password 6-32 chars          role   Operator | Admin
+          access   P = perpetual, T = timed
+          from/to  "YYYY-MM-DDTHH:MM" (RTC time) for T; empty for P
+        Fields must not contain '|' or control characters.
+        Examples:
+          ADD_USER|101|John Smith|john@plc.com|Pass1234|Operator|P||
+          ADD_USER|102|Ravi K|ravi@plc.com|Pass1234|Operator|T|2026-11-01T09:00|2026-11-05T17:00
+
+   PLC -> App (encrypted notify on the same characteristic):
+        ADD_USER_OK|reqId
+        ADD_USER_FAIL|reqId|reason
+          NOT_AUTH      app not logged in (reqId 0)
+          FORBIDDEN     caller is not an Admin, or role=Admin was requested
+          BAD_FORMAT    wrong field count / length / characters (reqId 0 if
+                        the reqId itself is unusable)
+          BAD_ROLE      role is not Operator or Admin
+          BAD_ACCESS    access not P/T, or bad / reversed from-to dates
+          EMAIL_EXISTS  email already registered (case-insensitive)
+          MAX_USERS     30 users already stored
+          BUSY          previous ADD_USER still being processed
+          STORAGE_FAIL  could not be saved to flash (user is rolled back)
+        Packets that fail decoding, decryption or the replay check are
+        dropped silently (no reply), like the DIGITAL characteristic.
+
+   Permissions match the web panel: an Admin may add Operators only; an
+   Operator may add nobody; the Super Admin has no BLE access.
+   Flow: the BLE task validates and queues the request; loop() stores the
+   user (saveUsers) and sends the reply, then writes a "USER_ADDED" line to the
+   SD event log ("<name> (<email>) added as <role> by <admin email>").
+   The new user's phone still has to be added in the Device Registry (web).
+
+ 5.7 EVENT LOG characteristic (browse / download the SD event log)
+   Characteristic: 6e400012-b5a3-f393-e0a9-e50e24dcca9e   WRITE + NOTIFY
+   (in the user-management service 6e400010-..., which now has 12 handles)
+   Admin only (others get FORBIDDEN). Requests use the usual AES-GCM packet
+   (hex or raw bytes) and replay counters. REPLIES ARE ENCRYPTED RAW BYTES
+   IV(12)|CIPHER|TAG(16), not hex. The app must negotiate an MTU >= 210
+   (request 517) before use, otherwise MTU_TOO_SMALL is returned.
+
+   Flow (month -> day -> data):
+     1. App  : LOG_MONTHS
+        PLC  : LOG_MONTH|YYYY-MM          (one per month folder, sorted)
+               LOG_END|count
+     2. App  : LOG_DATES|YYYY-MM
+        PLC  : LOG_DATE|YYYY-MM-DD|sizeBytes   (one per day file, sorted)
+               LOG_END|count
+     3. App  : LOG_DAY|YYYY-MM-DD[|fromSeq]
+        PLC  : LOG_LINE|seq|<log line as stored>   (one per line)
+               LOG_END|lastSeq|more
+   <log line> = "YYYY-MM-DD HH:MM:SS,CATEGORY,detail", cut to 150 chars
+   (ending "...") if longer. seq = line number within the day file, 1-based;
+   a gap in seq means a lost notification.
+   At most 1000 lines are sent per LOG_DAY. more=1 in LOG_END means the day has
+   more lines: send LOG_DAY again with fromSeq = lastSeq+1. fromSeq may also
+   be used to re-fetch after a gap. If omitted, fromSeq = 1.
+   Failure: LOG_FAIL|reason
+     NOT_AUTH, FORBIDDEN, BAD_FORMAT, NO_SD, NO_DATA (no such
+     month/day), BUSY (a transfer is already running), SD_FAIL,
+     MTU_TOO_SMALL.
+   Behaviour: one transfer at a time; one notification per ~20 ms loop cycle
+   (about 40-50 lines/s); a disconnect or logout cancels the transfer. Months
+   or days are read only from the validated YYYY-MM / YYYY-MM-DD names, so no
+   other SD file can be requested. "/events_undated.log" and old
+   events_YYYY-MM.log files are not offered over BLE.
+   Example:
+     LOG_DAY|2026-11-02
+       -> LOG_LINE|1|2026-11-02 08:01:10,LOGIN,Ravi K (ravi@plc.com) logged in from device PHONE-001
+       -> LOG_LINE|2|2026-11-02 08:01:11,CRANE_START,App cleared E-STOP by ravi@plc.com
+       -> LOG_END|2|0
 
 
 ================================================================================
@@ -347,7 +419,7 @@ Main features
 
  No AAD (additional data) is used.
  The same key and scheme apply to AUTH, DIGITAL, HEARTBEAT writes and to
- AUTH replies, STATUS and ANALOG notifications.
+ AUTH replies and STATUS notifications.
  NOTE: the initial "AUTH_REQ:..." prompt sent on connect is plain text.
 
 
@@ -415,8 +487,6 @@ Main features
  App->PLC    DIGITAL         estop,up,down,left,right  (0/1)    Yes
  PLC->App    STATUS          estop,up,down,left,right  (0/1)    Yes
  App->PLC    HEARTBEAT       HB                                 Yes
- PLC->App    ANALOG          H1,<v> | H2,<v> | H1,<v>,H2,<v>    Yes (currently
-                                                                not sent)
 
  Examples
    Move UP         : "0,1,0,0,0"
@@ -452,33 +522,12 @@ Main features
    - I0.7 and I0.8 can each be set to Digital or Analog mode.
        Digital : GPIO32 / GPIO33
        Analog  : GPIO34 / GPIO35 (labels A0.7 / A0.8)
-   - Hoist 1 / Hoist 2 input source - choose which input feeds each hoist
-     (shown only for enabled hoists).
    - Remote (E-STOP interlock) input - choose which input acts as the
      mobile-remote interlock (default I0.1; may be "none", which fails safe).
    - Saved in NVS namespace "inconfig"; pins re-initialised (applyInputConfig).
 
- 9.3 Hoist mode (hoistConfig)
-   HOIST_NONE (0), HOIST_ONE (1), HOIST_TWO (2), HOIST_BOTH (3).
-   Stored in NVS "hoistconfig". Loaded at boot (loadHoistConfig).
-
-
-================================================================================
-10. HOIST (ANALOG) HANDLING
-================================================================================
- printHoistValues() runs every loop but acts every 500 ms:
-   - For each enabled hoist, reads the assigned input.
-   - Analog input : analogRead() then scaleHoistAnalogValue():
-         raw <= 800  -> 0
-         raw >= 4095 -> 5000
-         otherwise   -> (raw - 800) * 5000 / (4095 - 800)   (linear)
-   - Digital input: digitalRead() value (0 or 1).
-   - No input assigned: value 0.
-   - Raw count and scaled value are printed to Serial:
-        "Hoist1 [A0.7, Analog]: raw=... scaled=..."
-   - The values are stored in hoistA1Value / hoistA2Value.
-   - notifyHoistValues() formats "H1,<int>" etc., encrypts it and notifies on
-     the ANALOG characteristic - but the call is currently commented out.
+ (Hoist handling - hoist mode, hoist input mapping, analog hoist reading and
+  the ANALOG BLE characteristic - has been removed from the firmware.)
 
 
 ================================================================================
@@ -569,7 +618,7 @@ Main features
    files       : (Admin) SD card file list with size and log entry count,
                  download / view-edit / delete / new file.
    outconfig   : output function & motion mapping.
-   inconfig    : I0.7/I0.8 mode, hoist inputs, remote interlock input.
+   inconfig    : I0.7/I0.8 mode, remote interlock input.
    network     : BLE name, Wi-Fi SSID and password.
    time        : device date and time (RTC) + current time display.
    (account page: change own name/password; logout from the user menu)
@@ -589,7 +638,7 @@ Main features
    GET  /login-as?idx=      Admin impersonates a user
    GET  /motion/status      JSON status (used by Home live update)
    POST /outconfig          save output mapping (supports fetch -> JSON)
-   POST /inconfig           save input / hoist / remote config
+   POST /inconfig           save input mode / remote config
    POST /netconfig          save BLE/Wi-Fi names, then reboot
    POST /timeconfig         set RTC date/time
    POST /devices            add device (Admin)
@@ -610,8 +659,11 @@ Main features
    per the code (estopOutputOn = motionEstop ? 0 : 1).
 
  Files tab details
-   - Operates on the SD root only; names validated (no path separators,
-     no leading '.', forbidden FAT characters, <= 60 chars).
+   - Lists the SD root and the month folders (YYYY-MM) in it; a folder is
+     opened with /?tab=files&dir=YYYY-MM and has an "All files" back button.
+     File routes take name=<file> (root) or name=YYYY-MM/<file>; nothing
+     deeper is allowed. New files can only be created in the root.
+   - Names validated (no leading '.', forbidden FAT characters, <= 60 chars).
    - Editable if file <= 4096 bytes; larger files are read-only and show only
      the last 16384 bytes. Download gives the full file.
    - Line (entry) count is computed only for files <= 262144 bytes.
@@ -685,9 +737,12 @@ Main features
 17. SD CARD EVENT LOGGING
 ================================================================================
  Optional - if the card is missing, events are only printed on Serial.
- Files   : one per month, "/events_YYYY-MM.log" (month taken from the event's
-           own timestamp); events without a valid time go to
-           "/events_undated.log".
+ Files   : one folder per month, one file per day:
+               /YYYY-MM/YYYY-MM-DD.log     e.g. /2026-11/2026-11-02.log
+           (folder and file are taken from the event's own timestamp and are
+           created on first use); events without a valid time go to
+           "/events_undated.log" in the SD root. Old month files
+           "/events_YYYY-MM.log" from earlier firmware are left untouched.
  Format  : CSV line  "YYYY-MM-DD HH:MM:SS,CATEGORY,detail"
  The file is opened in append mode, written and closed on every event (no data
  loss on power cut; a re-inserted card is picked up on the next write).
@@ -696,13 +751,21 @@ Main features
  Event categories
    LOGIN       "<name> (<email>) logged in from device <deviceId>"
    LOGOUT      "<name> (<email>) logged out"
+   LOGIN_FAIL  failed BLE login: "<REASON> - email: <email>, device: <id>"
+               REASON = BAD_CREDENTIALS | OUT_OF_TIME | UNTRUSTED_DEVICE.
+               Rate limited to one entry per 3 s; skipped attempts are
+               counted on the next entry. Email/device text is sanitised
+               (control characters and commas replaced, max 40 chars).
+   USER_ADDED  "<name> (<email>) added as <role> by <admin email>"
+               (user added from the mobile app)
    CRANE_START E-STOP output went HIGH (motionEstop false) + reason
    CRANE_STOP  E-STOP output went LOW  (motionEstop true)  + reason
    (reasons: boot, "I0.1 interlock opened", "App E-STOP command by ...",
     "App cleared E-STOP by ...", "App disconnected", "Heartbeat lost")
 
  Logs can be downloaded, viewed (last 16 KB) or deleted from the web
- "Files" tab.
+ "Files" tab (month folders are opened from the SD root listing), and can be
+ browsed and downloaded by an Admin from the mobile app (section 5.7).
 
 
 ================================================================================
@@ -714,9 +777,7 @@ Main features
               (name,email,pass,role,acc,start,end
               joined by 0x1F; old email_i... keys migrate)
  outconfig    pin_i_function, pin_i_motion           Output mapping
- inconfig     mode_i, hoist1_in, hoist2_in,          Input modes, hoist
-              remote_in                              inputs, interlock input
- hoistconfig  mode                                   Hoist enable mode
+ inconfig     mode_i, remote_in                      Input modes, interlock input
  netconfig    wifi_ssid, wifi_password, ble_name     Network names
  devices      count, dev_i, owner_i                  Device registry
  webadmin     user, pass                             Web admin credentials
@@ -780,13 +841,13 @@ Main features
    4. RTC init (set from compile time if power was lost), prime time cache.
    5. SD.begin(CS=5) -> sdOk.
    6. loadUsers (creates default admin if needed), loadOutputConfig,
-      loadHoistConfig, loadInputConfig.
+      loadInputConfig.
    7. Configure Q0_0..Q0_3 as outputs, S0..S3_24v as outputs set HIGH, all
       configured outputs LOW.
    8. loadNetworkConfig, forceAllOutputsOff.
    9. Start Wi-Fi AP, register web routes (setupWebRoutes).
   10. Release classic-BT memory, BLEDevice::init(bleName), create server,
-      service and the 5 characteristics with callbacks, start advertising.
+      service and the 4 characteristics + the user-management service with callbacks, start advertising.
 
  loop()  (every ~20 ms)
    1. updateEstopState()      - sample interlock, compute motionEstop.
@@ -799,7 +860,6 @@ Main features
    3. If mobileEstopSignal changed -> notifyMotionStatus().
    4. If motionEstop changed -> log CRANE_START / CRANE_STOP to SD.
    5. Drain pending LOGIN / LOGOUT events to SD.
-   6. printHoistValues() (every 500 ms).
    7. Every 2 s refresh software clock from RTC.
    8. webServer.handleClient().
    9. delay(20).
@@ -820,7 +880,6 @@ Main features
    Users            : 30        Registered devices : 20
    Web sessions     : 5         Session-counter table: 8 sessions
    Heartbeat timeout: 10 s      Auth timeout       : 60 s
-   Hoist scaling    : raw 800-4095 -> 0-5000
    File edit limit  : 4096 B    File view tail     : 16384 B
    Device ID length : 1-40      Reply plaintext max: 200 bytes
    Password (web account change): min 6 chars
@@ -850,8 +909,6 @@ Main features
 ================================================================================
 25. NOTES / OBSERVATIONS (from code review)
 ================================================================================
- - Hoist values are read and printed but NOT yet sent over BLE
-   (notifyHoistValues() call is commented out).
  - Firmware boot-time input/output pin configuration comments mention "9
    inputs"; the code uses NUM_INPUT_PINS = 9.
  - loadNetworkConfig() requires SSID/BLE name length >= 6 when loading from

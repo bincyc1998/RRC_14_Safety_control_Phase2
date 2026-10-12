@@ -99,24 +99,12 @@ struct InPin {
 extern const InPin INPUT_PINS[NUM_INPUT_PINS];
 extern uint8_t inputMode[NUM_INPUT_PINS]; // 0=digital,1=analog — only meaningful when switchable
 
-// Hoist configuration — defined in main.cpp
-#define HOIST_NONE  0
-#define HOIST_ONE   1
-#define HOIST_TWO   2
-#define HOIST_BOTH  3
-
-extern uint8_t hoistConfig;
-extern int8_t  hoistOneInputIdx; // index into INPUT_PINS feeding Hoist 1, -1 = unassigned
-extern int8_t  hoistTwoInputIdx; // index into INPUT_PINS feeding Hoist 2, -1 = unassigned
-
 // index into INPUT_PINS used as the mobile remote-control E-STOP interlock, -1 = unassigned
 extern int8_t  remoteInputIdx;
 
 void loadInputConfig();
 void saveInputConfig();
 void applyInputConfig();
-void loadHoistConfig();
-void saveHoistConfig();
 const char* getInputLabel(int idx); // mode-aware label, e.g. "I0.7" or "A0.7"
 void forceAllOutputsOff(); // drives every output LOW and latches E-STOP; defined in main.cpp
 
@@ -128,6 +116,7 @@ extern char wifiPassword[64];
 // NVS helpers defined in main.cpp, called from web handlers
 bool saveUsers(); // false if any NVS write failed (e.g. storage full)
 int  findUserIndexByEmail(const char* email); // case-insensitive; -1 if not found
+bool parseDateTimeLocal(const String& s, uint32_t& ts);  // "YYYY-MM-DDTHH:MM" -> seconds since 1970 (RTC time, no time zone)
 bool isUserAccessAllowed(const User& u);      // false = timed user outside their window (or clock unavailable)
 void saveOutputConfig();
 void applyOutputConfig();
@@ -153,5 +142,7 @@ uint8_t getMotionIdForLabel(const char* label);
 // RTC + SD event logging — defined in main.cpp
 extern bool rtcOk;
 extern bool sdOk;
+bool validMonthStr(const String& s); // "YYYY-MM"
+bool validDateStr(const String& s);  // "YYYY-MM-DD"
 String currentTimestamp(); // "YYYY-MM-DD HH:MM:SS", or "N/A" if RTC unavailable
 bool setRtcDateTime(int year, int month, int day, int hour, int minute, int second); // false if RTC unavailable

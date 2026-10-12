@@ -17,14 +17,22 @@
 #include "esp_log.h"
 #include "esp_bt.h"
 #include <time.h>
+#include <vector>
+#include <string>
+#include <algorithm>
 
 #define SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define DIGITAL_CHAR_UUID   "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 #define AUTH_CHAR_UUID      "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
 #define STATUS_CHAR_UUID    "6e400005-b5a3-f393-e0a9-e50e24dcca9e"
 #define HEARTBEAT_CHAR_UUID "6e400006-b5a3-f393-e0a9-e50e24dcca9e"
-#define ANALOG_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_SERVICE_HANDLE_COUNT 24
+
+// Second GATT service: user management from the mobile app (ADD_USER command)
+#define USERMGMT_SERVICE_UUID "6e400010-b5a3-f393-e0a9-e50e24dcca9e"
+#define USERMGMT_CHAR_UUID    "6e400011-b5a3-f393-e0a9-e50e24dcca9e"
+#define LOG_CHAR_UUID         "6e400012-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_USERMGMT_HANDLE_COUNT 12
 
 #define AUTH_TIMEOUT_MS  60000
 
@@ -83,10 +91,6 @@ const InPin INPUT_PINS[NUM_INPUT_PINS] = {
 };
 
 uint8_t inputMode[NUM_INPUT_PINS] = {0,0,0,0,0,0,0,0,0};
-
-uint8_t hoistConfig      = HOIST_NONE;
-int8_t  hoistOneInputIdx = -1;
-int8_t  hoistTwoInputIdx = -1;
 
 // Index into INPUT_PINS used as the mobile remote-control E-STOP interlock
 // input, configurable from the web UI's Input Configuration page. Defaults
@@ -324,8 +328,26 @@ bool setRtcDateTime(int year, int month, int day, int hour, int minute, int seco
   return false;
 }
 
-// Appends one CSV line ("timestamp,category,detail") to the current month's
-// SD event log (see the file-naming note above).
+// True for "YYYY-MM" / "YYYY-MM-DD" (digits and dashes in the right places,
+// month 01-12, day 01-31). Used for the log folder/file names — both when
+// logging and when the web panel / BLE app ask for a log by name.
+bool validMonthStr(const String &s) {
+  if (s.length() != 7 || s[4] != '-') return false;
+  for (int i : {0, 1, 2, 3, 5, 6}) if (s[i] < '0' || s[i] > '9') return false;
+  int mo = (s[5] - '0') * 10 + (s[6] - '0');
+  return mo >= 1 && mo <= 12;
+}
+bool validDateStr(const String &s) {
+  if (s.length() != 10 || s[7] != '-' || !validMonthStr(s.substring(0, 7))) return false;
+  if (s[8] < '0' || s[8] > '9' || s[9] < '0' || s[9] > '9') return false;
+  int d = (s[8] - '0') * 10 + (s[9] - '0');
+  return d >= 1 && d <= 31;
+}
+
+// Appends one CSV line ("timestamp,category,detail") to that day's SD event
+// log: "/YYYY-MM/YYYY-MM-DD.log" (one folder per month, one file per day,
+// taken from the event's own timestamp). Events with no valid time go to
+// "/events_undated.log".
 // Opens, writes and closes the file immediately on every call so an entry
 // is never lost to a power cut, and so a card that was reinserted after a
 // failure is picked back up on the very next call (no persistent flag).
@@ -342,13 +364,27 @@ void logEvent(const char* category, const String& detail) {
   // abort(). SD logging is an optional peripheral (see the block comment
   // above) — a failed open must degrade to "entry not persisted", the same
   // as every other SD failure here, never a reboot.
-  // ts is "YYYY-MM-DD HH:MM:SS", so its first 7 characters are the month.
-  String logPath = (ts.length() >= 7 && ts != "N/A")
-                     ? "/events_" + ts.substring(0, 7) + ".log"
-                     : String("/events_undated.log");
+  // ts is "YYYY-MM-DD HH:MM:SS": first 7 chars = month, first 10 = date.
+  bool   dated   = (ts.length() >= 10 && validDateStr(ts.substring(0, 10)));
+  String dirPath = dated ? "/" + ts.substring(0, 7) : String("");
+  String logPath = dated ? dirPath + "/" + ts.substring(0, 10) + ".log"
+                         : String("/events_undated.log");
   File f;
   try {
+    // The month folder is created on first use; remember the last one that
+    // exists so this isn't checked on every event. A failed open below clears
+    // the memory, so a swapped/re-formatted card gets its folder recreated.
+    static String knownDir;
+    if (dated && knownDir != dirPath) {
+      if (SD.exists(dirPath) || SD.mkdir(dirPath)) {
+        knownDir = dirPath;
+      } else {
+        Serial.println("logEvent: could not create month folder — entry not persisted");
+        return;
+      }
+    }
     f = SD.open(logPath, FILE_APPEND);
+    if (!f) knownDir = "";
   } catch (...) {
     Serial.printf("logEvent: SD open failed (likely low memory, %u bytes free) — entry not persisted\n",
                   (unsigned)ESP.getFreeHeap());
@@ -446,6 +482,10 @@ static std::string bytesToHex(const uint8_t *data, size_t len) {
   return out;
 }
 
+// Replies are now sent from more than one task (the BLE task and loop()), so
+// the IV counter increment is serialised: two replies must never share an IV.
+static SemaphoreHandle_t replyIvMutex = nullptr;
+
 // Encrypt plaintext into IV(12)|CIPHER|TAG(16) hex string (IV is replyIvCounter, incremented)
 static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) {
   size_t len = plain.size();
@@ -461,13 +501,17 @@ static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) 
     return false;
   }
 
+  uint8_t iv[12];
+  if (replyIvMutex) xSemaphoreTake(replyIvMutex, portMAX_DELAY);
   incrementReplyIv();
+  memcpy(iv, replyIvCounter, sizeof(iv));
+  if (replyIvMutex) xSemaphoreGive(replyIvMutex);
 
   int res = mbedtls_gcm_crypt_and_tag(
     &gcm,
     MBEDTLS_GCM_ENCRYPT,
     len,
-    replyIvCounter, 12,
+    iv, 12,
     NULL, 0,
     (const uint8_t*)plain.data(),
     ciphertext,
@@ -480,9 +524,21 @@ static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) 
 
   // Build final hex: IV + ciphertext + tag
   outHex.clear();
-  outHex += bytesToHex(replyIvCounter, 12);
+  outHex += bytesToHex(iv, 12);
   outHex += bytesToHex(ciphertext, len);
   outHex += bytesToHex(tag, 16);
+  return true;
+}
+
+// Same packet as encryptAESGCM_packet(), but as raw bytes IV(12)|CIPHER|TAG(16)
+// instead of hex text — half the size, for long notifications (event log).
+static bool encryptAESGCM_raw(const std::string &plain, std::string &outRaw) {
+  std::string hex;
+  if (!encryptAESGCM_packet(plain, hex)) return false;
+  uint8_t buf[256];
+  size_t n = 0;
+  if (!decodeHexText(hex, buf, sizeof(buf), &n)) return false;
+  outRaw.assign((const char*)buf, n);
   return true;
 }
 
@@ -743,6 +799,12 @@ bool lastLoggedMotionEstop = true;
 // So BLE callbacks just record the event here; loop() drains and logs it.
 volatile bool pendingLoginEvent  = false;
 volatile bool pendingLogoutEvent = false;
+// Set when the BLE client disconnects: tells loop() to abandon any event-log
+// transfer in progress (see processLogJob()).
+volatile bool logJobCancel = false;
+// Failed BLE logins are queued the same way (see loop() for the rate limit).
+volatile bool pendingLoginFailEvent = false;
+String        pendingLoginFailDetail;
 String        pendingLoginDetail;
 String        pendingLogoutDetail;
 
@@ -774,7 +836,6 @@ BLECharacteristic *digitalChar   = nullptr;
 BLECharacteristic *authChar      = nullptr;
 BLECharacteristic *statusChar    = nullptr;
 BLECharacteristic *heartbeatChar = nullptr;
-BLECharacteristic *analogChar     = nullptr;
 
 bool     deviceConnected  = false;
 bool     authenticated    = false;
@@ -1090,7 +1151,7 @@ void applyInputConfig() {
   }
 }
 
-// Reads input pin modes and hoist-input mapping from NVS namespace "inconfig".
+// Reads input pin modes and the remote-control interlock input from NVS namespace "inconfig".
 void loadInputConfig() {
   prefs.begin("inconfig", true);
   for (int i = 0; i < NUM_INPUT_PINS; i++) {
@@ -1099,13 +1160,9 @@ void loadInputConfig() {
     int m = prefs.getInt(key, INPUT_MODE_DIGITAL);
     inputMode[i] = (INPUT_PINS[i].switchable && m == INPUT_MODE_ANALOG) ? INPUT_MODE_ANALOG : INPUT_MODE_DIGITAL;
   }
-  hoistOneInputIdx = (int8_t)prefs.getInt("hoist1_in", -1);
-  hoistTwoInputIdx = (int8_t)prefs.getInt("hoist2_in", -1);
   remoteInputIdx   = (int8_t)prefs.getInt("remote_in", 1);
   prefs.end();
 
-  if (hoistOneInputIdx < -1 || hoistOneInputIdx >= NUM_INPUT_PINS) hoistOneInputIdx = -1;
-  if (hoistTwoInputIdx < -1 || hoistTwoInputIdx >= NUM_INPUT_PINS) hoistTwoInputIdx = -1;
   if (remoteInputIdx < -1 || remoteInputIdx >= NUM_INPUT_PINS) remoteInputIdx = 1;
 
   applyInputConfig();
@@ -1116,7 +1173,7 @@ void loadInputConfig() {
   }
 }
 
-// Persists input pin modes and hoist-input mapping to NVS.
+// Persists input pin modes and the remote-control interlock input to NVS.
 void saveInputConfig() {
   prefs.begin("inconfig", false);
   for (int i = 0; i < NUM_INPUT_PINS; i++) {
@@ -1124,8 +1181,6 @@ void saveInputConfig() {
     sprintf(key, "mode_%d", i);
     prefs.putInt(key, inputMode[i]);
   }
-  prefs.putInt("hoist1_in", hoistOneInputIdx);
-  prefs.putInt("hoist2_in", hoistTwoInputIdx);
   prefs.putInt("remote_in", remoteInputIdx);
   prefs.end();
   applyInputConfig();
@@ -1134,126 +1189,6 @@ void saveInputConfig() {
   for (int i = 0; i < NUM_INPUT_PINS; i++) {
     Serial.printf("  %s\n", getInputLabel(i));
   }
-}
-
-// Reads hoist mode (which hoists are enabled) from NVS namespace "hoistconfig".
-void loadHoistConfig() {
-  prefs.begin("hoistconfig", true);
-  int h = prefs.getInt("mode", HOIST_NONE);
-  prefs.end();
-  if (h < HOIST_NONE || h > HOIST_BOTH) h = HOIST_NONE;
-  hoistConfig = (uint8_t)h;
-  Serial.printf("Hoist config loaded: mode=%d\n", hoistConfig);
-}
-
-// Persists hoist mode to NVS.
-void saveHoistConfig() {
-  prefs.begin("hoistconfig", false);
-  prefs.putInt("mode", hoistConfig);
-  prefs.end();
-  Serial.printf("Hoist config saved: mode=%d\n", hoistConfig);
-}
-
-// Scales a raw ADC count into an engineering-unit hoist value: the
-// 800-4095 raw range maps linearly to 0-5000, clamped at both ends.
-static float scaleHoistAnalogValue(uint16_t raw) {
-  const float IN_MIN  = 800.0f;
-  const float IN_MAX  = 4095.0f;
-  const float OUT_MAX = 5000.0f;
-  if (raw <= IN_MIN) return 0.0f;
-  if (raw >= IN_MAX) return OUT_MAX;
-  return (raw - IN_MIN) * (OUT_MAX / (IN_MAX - IN_MIN));
-}
-
-float hoistA1Value = 0;
-float hoistA2Value = 0;
-
-// Sends the current hoist value(s) to the mobile app via the analog
-// characteristic. Payload is "H1,<val>" / "H2,<val>" / "H1,<val>,H2,<val>"
-// depending on which hoist(s) are enabled, AES-GCM encrypted the same way
-// as the other characteristics.
-static void notifyHoistValues() {
-  if (!deviceConnected || !authenticated || !analogChar) return;
-
-  char buf[64];
-  switch (hoistConfig) {
-    case HOIST_ONE:
-      snprintf(buf, sizeof(buf), "H1,%u", (unsigned)hoistA1Value);
-      break;
-    case HOIST_TWO:
-      snprintf(buf, sizeof(buf), "H2,%u", (unsigned)hoistA2Value);
-      break;
-    case HOIST_BOTH:
-      snprintf(buf, sizeof(buf), "H1,%u,H2,%u", (unsigned)hoistA1Value, (unsigned)hoistA2Value);
-      break;
-    case HOIST_NONE:
-    default:
-      return; // Don't send anything if no hoist selected
-  }
-
-  std::string outHex;
-  if (encryptAESGCM_packet(buf, outHex)) {
-    analogChar->setValue(outHex);
-    analogChar->notify();
-    Serial.printf("BLE hoist notify (encrypted): %s\n", buf);
-  } else {
-    Serial.println("BLE hoist notify: encryption failed, notify skipped");
-  }
-}
-
-static unsigned long lastHoistPrintTime = 0;
-#define HOIST_PRINT_INTERVAL_MS 500
-
-// Reads the input assigned to each enabled hoist and prints it to Serial.
-// For analog inputs this prints both the raw ADC count and the scaled
-// engineering value, so a stuck-at-zero raw count (no/low signal on the
-// terminal, or the input's physical mode switch not set to Analog) is easy
-// to tell apart from a scaling issue.
-static void printHoistValues() {
-  if (hoistConfig == HOIST_NONE) return;
-  if (millis() - lastHoistPrintTime < HOIST_PRINT_INTERVAL_MS) return;
-  lastHoistPrintTime = millis();
-  I2CGuard _i2cGuard;
-
-  bool wantHoist1 = (hoistConfig == HOIST_ONE || hoistConfig == HOIST_BOTH);
-  bool wantHoist2 = (hoistConfig == HOIST_TWO || hoistConfig == HOIST_BOTH);
-
-  if (wantHoist1) {
-    if (hoistOneInputIdx >= 0) {
-      bool isAnalog = INPUT_PINS[hoistOneInputIdx].switchable && inputMode[hoistOneInputIdx] == INPUT_MODE_ANALOG;
-      if (isAnalog) {
-        uint16_t raw = analogRead(getActiveInputPin(hoistOneInputIdx));
-        hoistA1Value = scaleHoistAnalogValue(raw);
-        Serial.printf("Hoist1 [%s, Analog]: raw=%u scaled=%.1f\n", getInputLabel(hoistOneInputIdx), raw, hoistA1Value);
-      } else {
-        int v = digitalRead(getActiveInputPin(hoistOneInputIdx));
-        hoistA1Value = v;
-        Serial.printf("Hoist1 [%s, Digital]: %d\n", getInputLabel(hoistOneInputIdx), v);
-      }
-    } else {
-      hoistA1Value = 0;
-      Serial.println("Hoist1: no input assigned");
-    }
-  }
-  if (wantHoist2) {
-    if (hoistTwoInputIdx >= 0) {
-      bool isAnalog = INPUT_PINS[hoistTwoInputIdx].switchable && inputMode[hoistTwoInputIdx] == INPUT_MODE_ANALOG;
-      if (isAnalog) {
-        uint16_t raw = analogRead(getActiveInputPin(hoistTwoInputIdx));
-        hoistA2Value = scaleHoistAnalogValue(raw);
-        Serial.printf("Hoist2 [%s, Analog]: raw=%u scaled=%.1f\n", getInputLabel(hoistTwoInputIdx), raw, hoistA2Value);
-      } else {
-        int v = digitalRead(getActiveInputPin(hoistTwoInputIdx));
-        hoistA2Value = v;
-        Serial.printf("Hoist2 [%s, Digital]: %d\n", getInputLabel(hoistTwoInputIdx), v);
-      }
-    } else {
-      hoistA2Value = 0;
-      Serial.println("Hoist2: no input assigned");
-    }
-  }
-
-  //notifyHoistValues();
 }
 
 // Reads BLE and WiFi credentials from NVS and applies defaults if missing.
@@ -1521,6 +1456,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     deviceConnected = false;
     authenticated   = false;
     connectedUserEmail[0] = '\0';
+    logJobCancel    = true;
     Serial.println("Mobile disconnected");
 
     // No command source for directional motion — stop it. E-STOP is also
@@ -1675,6 +1611,22 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
       if (!okCreds) Serial.printf("Authentication FAILED (bad credentials) — user: %s\n", email.c_str());
       if (okCreds && !okTime) Serial.printf("Authentication FAILED (outside allowed access time) — user: %s\n", email.c_str());
       if (!okDevice) Serial.printf("Authentication FAILED (unregistered device) — device: %s\n", deviceId.c_str());
+
+      // Queue a LOGIN_FAIL entry for the SD event log (written from loop()).
+      // The reason matches the AUTH_FAIL reply sent to the app. The email and
+      // device ID come from an unauthenticated client, so strip control
+      // characters and commas (they would corrupt the CSV line) and cap the length.
+      auto cleanForLog = [](const std::string &s) {
+        String o;
+        for (size_t i = 0; i < s.size() && i < 40; i++) {
+          unsigned char c = (unsigned char)s[i];
+          o += (c < 0x20 || c == 0x7F || c == ',') ? '_' : (char)c;
+        }
+        return o;
+      };
+      const char *failReason = !okCreds ? "BAD_CREDENTIALS" : (!okTime ? "OUT_OF_TIME" : "UNTRUSTED_DEVICE");
+      pendingLoginFailDetail = String(failReason) + " - email: " + cleanForLog(email) + ", device: " + cleanForLog(deviceId);
+      pendingLoginFailEvent  = true;
     }
 
     // Encrypt and send response
@@ -1934,6 +1886,545 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// ---------------- USER MANAGEMENT (ADD_USER) ----------------
+// Second GATT service, one write+notify characteristic. The app writes an
+// AES-GCM encrypted request (same packet format, key and replay counters as
+// the other characteristics) whose plaintext is:
+//   ADD_USER|reqId|name|email|password|role|access|from|to
+//     reqId  1-9 digits, echoed in the reply
+//     name   1-32 chars        email  1-40 chars, contains '@'
+//     password 6-32 chars      role   Operator | Admin
+//     access P (perpetual) | T (timed)
+//     from/to "YYYY-MM-DDTHH:MM" for T; empty for P
+// The reply is encrypted and notified on the same characteristic:
+//   ADD_USER_OK|reqId
+//   ADD_USER_FAIL|reqId|reason   (NOT_AUTH, FORBIDDEN, BAD_FORMAT, BAD_ROLE,
+//                                 BAD_ACCESS, EMAIL_EXISTS, MAX_USERS,
+//                                 BUSY, STORAGE_FAIL)
+// Permissions match the web panel: an Admin may add Operators only; an
+// Operator may add nobody. (The Super Admin has no BLE access.)
+// The BLE task only validates and queues the request; the flash write and
+// the final reply happen from loop(), like the SD login/logout events.
+BLECharacteristic *userMgmtChar = nullptr;
+
+volatile bool pendingAddUserFlag = false;
+char          pendingAddReqId[12] = "";
+User          pendingAddUser;
+String        pendingAddBy;
+
+static void sendUserMgmtReply(const std::string &plain) {
+  if (!userMgmtChar || !deviceConnected || !authenticated) return;
+  std::string outHex;
+  if (!encryptAESGCM_packet(plain, outHex)) {
+    Serial.println("UserMgmt: reply encryption failed, notify skipped");
+    return;
+  }
+  userMgmtChar->setValue(outHex);
+  userMgmtChar->notify();
+  Serial.printf("UserMgmt reply: %s\n", plain.c_str());
+}
+
+static void sendAddUserFail(const char *reqId, const char *reason) {
+  sendUserMgmtReply(std::string("ADD_USER_FAIL|") + reqId + "|" + reason);
+}
+
+// Splits on '|' keeping empty fields (the from/to fields may be empty).
+static std::vector<std::string> splitPipe(const std::string &s) {
+  std::vector<std::string> parts;
+  size_t start = 0;
+  while (true) {
+    size_t pos = s.find('|', start);
+    if (pos == std::string::npos) { parts.push_back(s.substr(start)); break; }
+    parts.push_back(s.substr(start, pos - start));
+    start = pos + 1;
+  }
+  return parts;
+}
+
+// Printable text only: no control characters (also keeps the 0x1F record
+// separator used by the user storage out of stored fields).
+static bool isCleanText(const std::string &s) {
+  for (unsigned char c : s) if (c < 0x20 || c == 0x7F) return false;
+  return true;
+}
+
+class UserMgmtCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    try {
+    if (!authenticated) {
+      Serial.println("UserMgmt rejected — not authenticated");
+      sendUserMgmtReply("ADD_USER_FAIL|0|NOT_AUTH");
+      return;
+    }
+
+    std::string value = pCharacteristic->getValue();
+    if (value.empty()) return;
+
+    uint8_t encrypted[512];
+    size_t encryptedLen = 0;
+    if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen) || encryptedLen < 12 + 16) {
+      Serial.println("UserMgmt rejected — unable to decode encrypted payload");
+      return;
+    }
+
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.println("UserMgmt rejected — counter not incremented (replay/stale)");
+      return;
+    }
+
+    uint8_t decrypted[256];
+    size_t decryptedLen = 0;
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+      Serial.println("UserMgmt: AES-GCM decryption failed");
+      return;
+    }
+    updateLastCounter(sessionId, counter);
+
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    std::vector<std::string> f = splitPipe(reinterpret_cast<char*>(decrypted));
+    if (f.size() != 9 || f[0] != "ADD_USER") {
+      Serial.println("UserMgmt: bad format — expected 9 pipe-separated fields starting with ADD_USER");
+      sendAddUserFail("0", "BAD_FORMAT");
+      return;
+    }
+
+    // reqId: 1-9 digits, echoed back in every reply
+    const std::string &reqId = f[1];
+    bool reqOk = !reqId.empty() && reqId.size() <= 9;
+    for (unsigned char c : reqId) if (c < '0' || c > '9') reqOk = false;
+    if (!reqOk) {
+      sendAddUserFail("0", "BAD_FORMAT");
+      return;
+    }
+    const char *rid = reqId.c_str();
+
+    // Permission: only a logged-in Admin may add users, and only Operators.
+    int callerIdx = findUserIndexByEmail(connectedUserEmail);
+    if (callerIdx < 0 || strcmp(users[callerIdx].role, "Admin") != 0) {
+      Serial.printf("UserMgmt: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
+      sendAddUserFail(rid, "FORBIDDEN");
+      return;
+    }
+
+    const std::string &name = f[2], &email = f[3], &password = f[4], &role = f[5], &access = f[6];
+    if (name.empty() || name.size() > 32 ||
+        email.empty() || email.size() > 40 || email.find('@') == std::string::npos ||
+        password.size() < 6 || password.size() > 32 ||
+        !isCleanText(name) || !isCleanText(email) || !isCleanText(password)) {
+      sendAddUserFail(rid, "BAD_FORMAT");
+      return;
+    }
+    if (role != "Operator" && role != "Admin") {
+      sendAddUserFail(rid, "BAD_ROLE");
+      return;
+    }
+    if (role == "Admin") {          // Admins can only create Operators
+      sendAddUserFail(rid, "FORBIDDEN");
+      return;
+    }
+
+    User nu = {};
+    if (access == "P") {
+      nu.accessType = ACCESS_PERPETUAL;
+    } else if (access == "T") {
+      uint32_t from = 0, to = 0;
+      if (!parseDateTimeLocal(String(f[7].c_str()), from) ||
+          !parseDateTimeLocal(String(f[8].c_str()), to) || to <= from) {
+        sendAddUserFail(rid, "BAD_ACCESS");
+        return;
+      }
+      nu.accessType = ACCESS_TIMED;
+      nu.startTs    = from;
+      nu.endTs      = to;
+    } else {
+      sendAddUserFail(rid, "BAD_ACCESS");
+      return;
+    }
+
+    if (findUserIndexByEmail(email.c_str()) >= 0) {
+      sendAddUserFail(rid, "EMAIL_EXISTS");
+      return;
+    }
+    if (userCount >= MAX_USERS) {
+      sendAddUserFail(rid, "MAX_USERS");
+      return;
+    }
+    if (pendingAddUserFlag) {       // previous request still waiting for loop()
+      sendAddUserFail(rid, "BUSY");
+      return;
+    }
+
+    strncpy(nu.name,     name.c_str(),     sizeof(nu.name) - 1);
+    strncpy(nu.email,    email.c_str(),    sizeof(nu.email) - 1);
+    strncpy(nu.password, password.c_str(), sizeof(nu.password) - 1);
+    strncpy(nu.role,     role.c_str(),     sizeof(nu.role) - 1);
+    pendingAddUser = nu;
+    strncpy(pendingAddReqId, rid, sizeof(pendingAddReqId) - 1);
+    pendingAddReqId[sizeof(pendingAddReqId) - 1] = '\0';
+    pendingAddBy = connectedUserEmail;
+    pendingAddUserFlag = true;      // set last: loop() starts processing now
+    } catch (...) {
+      // See AuthCallbacks::onWrite — same BLE-callback exception firewall.
+      Serial.println("UserMgmtCallbacks::onWrite: exception (likely low memory) — write ignored");
+    }
+  }
+};
+
+// Called from loop(): stores the queued user and sends the final reply.
+static void processPendingAddUser() {
+  if (!pendingAddUserFlag) return;
+
+  char reqId[12];
+  strncpy(reqId, pendingAddReqId, sizeof(reqId));
+  reqId[sizeof(reqId) - 1] = '\0';
+  User nu = pendingAddUser;
+  String by = pendingAddBy;
+
+  // The user list may have changed (web panel) since the request was queued.
+  if (findUserIndexByEmail(nu.email) >= 0) {
+    sendAddUserFail(reqId, "EMAIL_EXISTS");
+  } else if (userCount >= MAX_USERS) {
+    sendAddUserFail(reqId, "MAX_USERS");
+  } else {
+    users[userCount] = nu;
+    userCount++;
+    if (saveUsers()) {
+      Serial.printf("UserMgmt: user added from app — %s (%s) by %s\n", nu.email, nu.role, by.c_str());
+      logEvent("USER_ADDED", String(nu.name) + " (" + String(nu.email) + ") added as " + String(nu.role) + " by " + by);
+      sendUserMgmtReply(std::string("ADD_USER_OK|") + reqId);
+    } else {
+      userCount--;                  // roll back: could not be stored persistently
+      memset(&users[userCount], 0, sizeof(User));
+      sendAddUserFail(reqId, "STORAGE_FAIL");
+    }
+  }
+  pendingAddUserFlag = false;
+}
+
+// ---------------- EVENT LOG over BLE ----------------
+// A characteristic in the user-management service lets a logged-in ADMIN
+// browse and download the SD event log. Requests are AES-GCM encrypted like
+// every other command (plaintext below); the PLC answers with notifications
+// that are encrypted RAW BYTES  IV(12)|CIPHER|TAG(16)  (not hex — a log line
+// would not fit in one notification as hex). The app must negotiate an MTU of
+// at least LOG_MIN_PEER_MTU.
+//   LOG_MONTHS                       -> LOG_MONTH|YYYY-MM  (one per month folder)
+//                                       LOG_END|count
+//   LOG_DATES|YYYY-MM                -> LOG_DATE|YYYY-MM-DD|sizeBytes (one per day file)
+//                                       LOG_END|count
+//   LOG_DAY|YYYY-MM-DD[|fromSeq]     -> LOG_LINE|seq|<csv line>  (one per log line)
+//                                       LOG_END|lastSeq|more
+//   any failure                      -> LOG_FAIL|reason
+// reasons: NOT_AUTH FORBIDDEN BAD_FORMAT NO_SD NO_DATA BUSY SD_FAIL MTU_TOO_SMALL
+// At most LOG_MAX_LINES_PER_REQUEST lines are sent per LOG_DAY; more=1 means
+// the day has further lines — repeat with fromSeq = lastSeq+1. seq is the
+// line number within the day file (1-based), so a gap means a lost packet.
+// The BLE task only validates and queues the request; loop() does all SD work
+// and sends ONE notification per loop cycle, so the safety loop keeps its
+// timing and the phone's notification queue is never flooded.
+#define LOG_LINE_MAX_CHARS        150
+#define LOG_MAX_LINES_PER_REQUEST 1000
+#define LOG_MIN_PEER_MTU          210   // 205-byte largest notification + 3 ATT header
+
+BLECharacteristic *logChar = nullptr;
+static SemaphoreHandle_t logTxMutex = nullptr;
+
+enum LogJobType : uint8_t { LOGJOB_MONTHS, LOGJOB_DATES, LOGJOB_DAY };
+
+// Request handed from the BLE task to loop()
+volatile bool logReqPending = false;
+static LogJobType logReqType = LOGJOB_MONTHS;
+static String     logReqArg;
+static uint32_t   logReqFromSeq = 1;
+
+// Job currently running (loop() only)
+static bool        logJobActive = false;
+static LogJobType  logJobType = LOGJOB_MONTHS;
+static std::vector<String> logJobItems;   // months / "date|size" entries
+static size_t      logJobIndex = 0;
+static String      logJobPath;            // LOG_DAY file
+static uint32_t    logJobOffset = 0;      // byte position of the next unread line
+static uint32_t    logJobSeq = 0;         // last line number read
+static uint32_t    logJobFromSeq = 1;
+static uint32_t    logJobSent = 0;
+
+static void sendLogPacket(const std::string &plain) {
+  if (!logChar || !deviceConnected || !authenticated) return;
+  std::string raw;
+  if (!encryptAESGCM_raw(plain, raw)) {
+    Serial.println("EventLog: reply encryption failed, notify skipped");
+    return;
+  }
+  if (logTxMutex) xSemaphoreTake(logTxMutex, portMAX_DELAY);
+  logChar->setValue((uint8_t*)raw.data(), raw.size());
+  logChar->notify();
+  if (logTxMutex) xSemaphoreGive(logTxMutex);
+}
+
+static void sendLogFail(const char *reason) {
+  sendLogPacket(std::string("LOG_FAIL|") + reason);
+}
+
+// SD.open() can throw std::bad_alloc under low heap (see logEvent()).
+static bool openSd(const String &path, File &f) {
+  try {
+    f = SD.open(path, FILE_READ);
+  } catch (...) {
+    return false;
+  }
+  return (bool)f;
+}
+
+// Name part of a directory entry (some SD cores return the full path).
+static String baseName(const char *n) {
+  String s = n;
+  int sl = s.lastIndexOf('/');
+  return sl >= 0 ? s.substring(sl + 1) : s;
+}
+
+class LogCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    try {
+    if (!authenticated) {
+      Serial.println("EventLog rejected — not authenticated");
+      sendLogFail("NOT_AUTH");
+      return;
+    }
+
+    std::string value = pCharacteristic->getValue();
+    if (value.empty()) return;
+
+    uint8_t encrypted[256];
+    size_t encryptedLen = 0;
+    if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen) || encryptedLen < 12 + 16) {
+      Serial.println("EventLog rejected — unable to decode encrypted payload");
+      return;
+    }
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.println("EventLog rejected — counter not incremented (replay/stale)");
+      return;
+    }
+    uint8_t decrypted[128];
+    size_t decryptedLen = 0;
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+      Serial.println("EventLog: AES-GCM decryption failed");
+      return;
+    }
+    updateLastCounter(sessionId, counter);
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    std::vector<std::string> f = splitPipe(reinterpret_cast<char*>(decrypted));
+    if (f.empty()) { sendLogFail("BAD_FORMAT"); return; }
+
+    LogJobType type;
+    if (f[0] == "LOG_MONTHS" && f.size() == 1)                          type = LOGJOB_MONTHS;
+    else if (f[0] == "LOG_DATES" && f.size() == 2)                      type = LOGJOB_DATES;
+    else if (f[0] == "LOG_DAY" && (f.size() == 2 || f.size() == 3))     type = LOGJOB_DAY;
+    else { sendLogFail("BAD_FORMAT"); return; }
+
+    // Only an Admin may read the event log.
+    int callerIdx = findUserIndexByEmail(connectedUserEmail);
+    if (callerIdx < 0 || strcmp(users[callerIdx].role, "Admin") != 0) {
+      Serial.printf("EventLog: FORBIDDEN — caller %s is not an Admin\n", connectedUserEmail);
+      sendLogFail("FORBIDDEN");
+      return;
+    }
+
+    String arg = "";
+    uint32_t fromSeq = 1;
+    if (type == LOGJOB_DATES) {
+      arg = f[1].c_str();
+      if (!validMonthStr(arg)) { sendLogFail("BAD_FORMAT"); return; }
+    } else if (type == LOGJOB_DAY) {
+      arg = f[1].c_str();
+      if (!validDateStr(arg)) { sendLogFail("BAD_FORMAT"); return; }
+      if (f.size() == 3) {
+        const std::string &fs = f[2];
+        bool fsOk = !fs.empty() && fs.size() <= 7;
+        for (unsigned char c : fs) if (c < '0' || c > '9') fsOk = false;
+        fromSeq = fsOk ? (uint32_t)strtoul(fs.c_str(), nullptr, 10) : 0;
+        if (!fsOk || fromSeq < 1) { sendLogFail("BAD_FORMAT"); return; }
+      }
+    }
+
+    // Notifications are up to ~205 bytes; refuse early if the link can't carry them.
+    if (pBLEServer && pBLEServer->getPeerMTU(connId) < LOG_MIN_PEER_MTU) {
+      Serial.printf("EventLog: MTU too small (%u)\n", (unsigned)pBLEServer->getPeerMTU(connId));
+      sendLogFail("MTU_TOO_SMALL");
+      return;
+    }
+    if (logReqPending || logJobActive) { sendLogFail("BUSY"); return; }
+
+    logReqType = type;
+    logReqArg     = arg;
+    logReqFromSeq = fromSeq;
+    logReqPending = true;           // set last: loop() starts processing now
+    } catch (...) {
+      // See AuthCallbacks::onWrite — same BLE-callback exception firewall.
+      Serial.println("LogCallbacks::onWrite: exception (likely low memory) — write ignored");
+    }
+  }
+};
+
+static void endLogJob() {
+  logJobActive = false;
+  logJobItems.clear();
+  logJobItems.shrink_to_fit();
+}
+
+// Prepares the queued request. Returns false (after sending LOG_FAIL) if it
+// can't run.
+static bool startLogJob() {
+  logJobType = logReqType;
+  String arg = logReqArg;
+  logJobFromSeq = logReqFromSeq;
+  logReqPending = false;
+  logJobItems.clear();
+  logJobIndex = 0;
+
+  try {
+    if (logJobType == LOGJOB_MONTHS) {
+      File root;
+      if (!openSd("/", root) || !root.isDirectory()) { sendLogFail("NO_SD"); return false; }
+      File e = root.openNextFile();
+      while (e && logJobItems.size() < 60) {
+        if (e.isDirectory()) {
+          String nm = baseName(e.name());
+          if (validMonthStr(nm)) logJobItems.push_back(nm);
+        }
+        e.close();
+        e = root.openNextFile();
+      }
+      if (e) e.close();
+      root.close();
+      std::sort(logJobItems.begin(), logJobItems.end());
+    } else if (logJobType == LOGJOB_DATES) {
+      File dir;
+      if (!openSd("/" + arg, dir) || !dir.isDirectory()) { sendLogFail("NO_DATA"); return false; }
+      File e = dir.openNextFile();
+      while (e && logJobItems.size() < 31) {
+        if (!e.isDirectory()) {
+          String nm = baseName(e.name());
+          if (nm.length() == 14 && nm.endsWith(".log")) {
+            String day = nm.substring(0, 10);
+            if (validDateStr(day) && day.startsWith(arg)) logJobItems.push_back(day + "|" + String((unsigned long)e.size()));
+          }
+        }
+        e.close();
+        e = dir.openNextFile();
+      }
+      if (e) e.close();
+      dir.close();
+      std::sort(logJobItems.begin(), logJobItems.end());
+    } else {
+      logJobPath = "/" + arg.substring(0, 7) + "/" + arg + ".log";
+      File f;
+      if (!openSd(logJobPath, f) || f.isDirectory()) { sendLogFail("NO_DATA"); return false; }
+      f.close();
+      logJobOffset = 0;
+      logJobSeq    = 0;
+      logJobSent   = 0;
+    }
+  } catch (...) {
+    sendLogFail("SD_FAIL");
+    return false;
+  }
+  logJobActive = true;
+  Serial.printf("EventLog: job started (type %d)\n", (int)logJobType);
+  return true;
+}
+
+// Sends the next notification of the running job (at most one per call).
+static void stepLogJob() {
+  if (logJobType == LOGJOB_MONTHS || logJobType == LOGJOB_DATES) {
+    const char *tag = (logJobType == LOGJOB_MONTHS) ? "LOG_MONTH|" : "LOG_DATE|";
+    if (logJobIndex < logJobItems.size()) {
+      sendLogPacket(std::string(tag) + logJobItems[logJobIndex].c_str());
+      logJobIndex++;
+    } else {
+      sendLogPacket(std::string("LOG_END|") + std::to_string(logJobItems.size()));
+      endLogJob();
+    }
+    return;
+  }
+
+  // LOG_DAY: read one line from the stored byte offset and send it.
+  File f;
+  try {
+    if (!openSd(logJobPath, f)) { sendLogFail("SD_FAIL"); endLogJob(); return; }
+    if (logJobOffset > 0 && !f.seek(logJobOffset)) { f.close(); sendLogFail("SD_FAIL"); endLogJob(); return; }
+
+    if (logJobSent >= LOG_MAX_LINES_PER_REQUEST) {   // per-request cap reached
+      bool more = logJobOffset < (uint32_t)f.size();
+      f.close();
+      sendLogPacket(std::string("LOG_END|") + std::to_string(logJobSeq) + "|" + (more ? "1" : "0"));
+      endLogJob();
+      return;
+    }
+
+    int skipBudget = 500;   // lines skipped (to reach fromSeq) per loop cycle
+    while (true) {
+      char line[LOG_LINE_MAX_CHARS + 1];
+      size_t n = 0;
+      bool trunc = false;
+      uint32_t consumed = 0;
+      int c;
+      while ((c = f.read()) >= 0) {
+        consumed++;
+        if (c == '\n') break;
+        if (c == '\r') continue;
+        if (n < LOG_LINE_MAX_CHARS) line[n++] = (char)c; else trunc = true;
+      }
+      if (c < 0 && n == 0) {                          // end of file
+        f.close();
+        sendLogPacket(std::string("LOG_END|") + std::to_string(logJobSeq) + "|0");
+        endLogJob();
+        return;
+      }
+      logJobOffset += consumed;
+      if (n == 0) continue;                           // blank line
+      logJobSeq++;
+      if (logJobSeq < logJobFromSeq) {                // still skipping to fromSeq
+        if (--skipBudget <= 0) { f.close(); return; } // continue next cycle
+        continue;
+      }
+      if (trunc && n >= 3) { line[n - 3] = '.'; line[n - 2] = '.'; line[n - 1] = '.'; }
+      f.close();
+      sendLogPacket(std::string("LOG_LINE|") + std::to_string(logJobSeq) + "|" + std::string(line, n));
+      logJobSent++;
+      return;
+    }
+  } catch (...) {
+    sendLogFail("SD_FAIL");
+    endLogJob();
+  }
+}
+
+// Called from loop().
+static void processLogJob() {
+  if (logJobCancel) {                    // client disconnected: drop everything
+    logJobCancel = false;
+    logReqPending = false;
+    endLogJob();
+    return;
+  }
+  if (logJobActive && (!deviceConnected || !authenticated)) { endLogJob(); return; }
+  if (!logJobActive) {
+    if (!logReqPending) return;
+    if (!startLogJob()) return;
+  }
+  stepLogJob();
+}
+
 // Manual I2C bus-recovery sequence (per NXP AN10216-01 / DS3231 app notes),
 // run once before Wire.begin(). If a previous run of this firmware
 // crashed or reset mid I2C-transaction (which happened repeatedly while
@@ -1998,6 +2489,8 @@ void setup() {
   // Must exist before any I2C-touching call (RTC or MCP23017-backed
   // digitalRead/digitalWrite) can run from any task, BLE included.
   i2cMutex = xSemaphoreCreateMutex();
+  replyIvMutex = xSemaphoreCreateMutex();
+  logTxMutex = xSemaphoreCreateMutex();
 
   // RTC + SD event logging — optional peripherals; init failures are
   // logged but never halt the PLC (this is safety-critical control
@@ -2057,7 +2550,6 @@ void setup() {
 
   loadUsers();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
-  loadHoistConfig();   // reads NVS, which hoist(s) are enabled
   loadInputConfig();   // reads NVS, applies pinMode INPUT for all 9 inputs
   // Explicitly configure digital outputs and 24V supply pins
   pinMode(Q0_0, OUTPUT);
@@ -2135,13 +2627,25 @@ void setup() {
   );
   heartbeatChar->setCallbacks(new HeartbeatCallbacks());
 
-  analogChar = pService->createCharacteristic(
-    ANALOG_CHAR_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  analogChar->addDescriptor(new BLE2902());
-
   pService->start();
+
+  // Second service: user management (ADD_USER) from the mobile app.
+  BLEService *pUserService = pBLEServer->createService(BLEUUID(USERMGMT_SERVICE_UUID), BLE_USERMGMT_HANDLE_COUNT);
+  userMgmtChar = pUserService->createCharacteristic(
+    USERMGMT_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  userMgmtChar->addDescriptor(new BLE2902());
+  userMgmtChar->setCallbacks(new UserMgmtCallbacks());
+
+  // Event log browsing/download (Admin only) — see "EVENT LOG over BLE".
+  logChar = pUserService->createCharacteristic(
+    LOG_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  logChar->addDescriptor(new BLE2902());
+  logChar->setCallbacks(new LogCallbacks());
+  pUserService->start();
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   BLEAdvertisementData advertData;
@@ -2261,8 +2765,33 @@ void loop() {
     pendingLogoutEvent = false;
     logEvent("LOGOUT", pendingLogoutDetail);
   }
+  // Failed logins: at most one SD entry per LOGIN_FAIL_LOG_INTERVAL_MS, so a
+  // client retrying in a loop can't flood or fill the card. Attempts skipped
+  // in between are counted and reported on the next entry.
+  static unsigned long lastLoginFailLogMs   = 0;
+  static uint32_t      suppressedLoginFails = 0;
+  const unsigned long  LOGIN_FAIL_LOG_INTERVAL_MS = 3000;
+  if (pendingLoginFailEvent) {
+    pendingLoginFailEvent = false;
+    if (lastLoginFailLogMs == 0 || millis() - lastLoginFailLogMs >= LOGIN_FAIL_LOG_INTERVAL_MS) {
+      String detail = pendingLoginFailDetail;
+      if (suppressedLoginFails > 0) {
+        detail += " (+" + String((unsigned long)suppressedLoginFails) + " more failed attempts not logged)";
+        suppressedLoginFails = 0;
+      }
+      lastLoginFailLogMs = millis();
+      if (lastLoginFailLogMs == 0) lastLoginFailLogMs = 1;
+      logEvent("LOGIN_FAIL", detail);
+    } else {
+      suppressedLoginFails++;
+    }
+  }
 
-  printHoistValues();
+  // Store a user queued by the app's ADD_USER command and send its reply.
+  processPendingAddUser();
+
+  // Event-log download for the app: one notification per loop cycle.
+  processLogJob();
 
   // Periodic software-clock resync (see the cache comment near
   // syncTimeCache()'s definition) — off any event's critical path, so a
