@@ -1,0 +1,57 @@
+[OPTIONS]
+Compatibility=1.1
+Full-text search=Yes
+Contents file=index.hhc
+Default Window=main
+Default topic=index.html
+Index file=index.hhk
+Language=0x409 English (United States)
+Title=rtc10
+
+[WINDOWS]
+main="rtc10","index.hhc","index.hhk","index.html","index.html",,,,,0x23520,,0x10387e,,,,,,,,0
+
+[FILES]
+_r_e_a_d_m_e_8md.html
+annotated.html
+classes.html
+dir_2d0c2b5d95081c5879de1b984a563738.html
+dir_596ca1420077b016698f3e6eae8dc8eb.html
+dir_9bbaefebc57ed2ba01b3c93619356d64.html
+dir_a5bdbfbbaa7895161d62825676df7980.html
+dir_cbf23886689bcefbd0871acc7a8935fe.html
+files.html
+functions.html
+functions_vars.html
+globals.html
+globals_defs.html
+globals_func.html
+globals_vars.html
+group__disable__enable.html
+group__error__code.html
+group__macros.html
+group__map__mikrobus.html
+group__public__function.html
+group__register__address.html
+group__rtc10.html
+group__slave__address.html
+group__type.html
+index.html
+main_8c.html
+modules.html
+rtc10_8h.html
+rtc10_8h_source.html
+structrtc10__cfg__t.html
+structrtc10__t.html
+bc_s.png
+bdwn.png
+closed.png
+nav_f.png
+nav_h.png
+open.png
+sync_off.png
+sync_on.png
+tab_a.png
+tab_b.png
+tab_h.png
+tab_s.png

@@ -1,0 +1,1013 @@
+================================================================================
+ RRC 14 SAFETY CONTROL - PHASE 2
+ "Intelli RRC" Mini PLC Safety / Remote-Control Firmware
+ Project Documentation
+================================================================================
+
+Firmware string : "REV_1.0.0 - Safety control - Mini PLC"   (FIRMWARE_VERSION)
+Target hardware : Industrial Shields 14 I/O PLC, ESP32 based (PlatformIO board
+                  "14iosplc_ma", custom_version = 4)
+Framework       : Arduino (framework-industrialshields-esp32 2.2.4)
+Source files    : src/main.cpp         - core logic, BLE, safety, I/O, RTC, SD log
+                  src/web_handler.cpp  - embedded web server (HTTP UI)
+                  src/web_handler.h    - shared types, constants, extern globals
+                  lib/rtc10/           - Arduino/Wire driver for RTC 10 Click
+                  partitions.csv       - dual-slot OTA flash layout
+                  platformio.ini       - build configuration
+
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+ 1. Project overview
+ 2. Hardware and peripherals
+ 3. System architecture
+ 4. Safety logic (E-STOP, heartbeat, interlock)
+ 5. Bluetooth LE interface (service, characteristics, data flow)
+ 6. BLE security (AES-GCM encryption, replay protection)
+ 7. BLE authentication sequence
+ 8. Command / status / heartbeat / analog data formats
+ 9. Input and output configuration
+10. Hoist (analog) handling
+11. User management and access control
+12. Device registry
+13. Wi-Fi access point and web panel
+14. Web panel pages and HTTP routes
+15. Web security and session handling
+16. RTC, software clock and time & date
+17. SD card event logging
+18. Persistent storage (NVS) map
+19. OTA firmware update
+20. Network settings (BLE name, Wi-Fi SSID/password)
+21. Robustness / stability measures
+22. Boot sequence (setup) and main loop
+23. Default credentials and limits
+24. Build and flash
+25. Known notes / observations
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+This firmware turns an ESP32-based Industrial Shields PLC into a safety-gated
+remote controller for a crane/hoist-type machine (motions: UP, DOWN, LEFT,
+RIGHT plus an E-STOP relay).
+
+An operator uses a mobile app ("IntelliHMI") that connects to the PLC over
+Bluetooth LE. The app logs in with email + password + registered device ID,
+then sends encrypted motion commands and a periodic encrypted heartbeat. The
+PLC drives its physical outputs only while:
+   - the mobile user is authenticated,
+   - the heartbeat is alive,
+   - the E-STOP is cleared by BOTH the app and the physical interlock input.
+
+At the same time the PLC runs its own Wi-Fi access point and a password
+protected web panel ("INTELLI RRC") used to:
+   - manage users, registered phones, timed access,
+   - configure outputs / inputs / hoists,
+   - change Wi-Fi and BLE names,
+   - set the clock, browse/edit the SD event logs,
+   - update the firmware over the air.
+
+Main features
+   * BLE GATT server with 5 characteristics (command, auth, status,
+     heartbeat, analog/hoist).
+   * All BLE traffic after the handshake is AES-128-GCM encrypted, with
+     per-session counters to block replay attacks.
+   * Multi-condition fail-safe E-STOP (app command, physical input I0.1,
+     BLE disconnect, heartbeat loss).
+   * Up to 10 users (Admin / Operator), Perpetual or Timed access windows.
+   * Up to 20 registered mobile devices (device whitelist).
+   * Fully configurable output mapping (5 outputs -> DF1..DF5 -> motion).
+   * Configurable inputs (I0.7 / I0.8 digital or analog), up to 2 hoist
+     analog channels, configurable E-STOP interlock input.
+   * Battery-backed RTC (DS3231M) for timestamps and timed access.
+   * SD card monthly CSV event log (login, logout, crane start/stop).
+   * OTA firmware update from the browser with rollback-safe dual partitions.
+   * Web UI works on phones (responsive layout).
+
+
+================================================================================
+2. HARDWARE AND PERIPHERALS
+================================================================================
+ MCU / board
+   ESP32 on Industrial Shields 14 I/O PLC (board id 14iosplc_ma).
+   Serial monitor : 115200 baud.
+
+ Digital outputs (OUTPUT_PINS table, index 0-4)
+   idx 0 -> R0_0 (relay output, default E-STOP relay)
+   idx 1 -> Q0_0
+   idx 2 -> Q0_1
+   idx 3 -> Q0_2
+   idx 4 -> Q0_3
+   Each output is assigned a logical "digital function" (DF1..DF5) and a
+   motion (see section 9).
+
+ Digital / analog inputs (INPUT_PINS table, 9 inputs)
+   I0.0 .. I0.6 : digital only
+   I0.7 : digital GPIO32 (I0_7)  OR analog GPIO34 (label A0.7)
+   I0.8 : digital GPIO33 (I0_8)  OR analog GPIO35 (label A0.8)
+   The mode of I0.7 / I0.8 is selectable in the web UI (Input Config).
+
+ I2C bus (Wire, 50 kHz, timeout 20 ms)
+   - On-board MCP23017 expander: I0.0-I0.6, the R0_0 relay and the 24 V
+     enable pins are NOT direct GPIOs; they are accessed over I2C.
+   - RTC 10 Click (DS3231M), I2C address 0x68.
+
+ 24 V supply enable pins
+   S0_24v, S1_24v, S2_24v, S3_24v are set as outputs and driven HIGH at boot.
+
+ SD card
+   microSD slot, chip-select GPIO 5 (VSPI SS). Optional.
+
+ Radio
+   - Wi-Fi in Access-Point mode (no station mode).
+   - Bluetooth LE only. Classic-BT controller memory is released at boot
+     (esp_bt_controller_mem_release) to gain ~70 KB heap.
+
+ Flash layout (partitions.csv, 4 MB)
+   nvs      0x9000   0x5000   (settings storage, 20 KB)
+   otadata  0xE000   0x2000
+   ota_0    0x10000  0x1F0000 (~1.94 MB)
+   ota_1    0x200000 0x1F0000 (~1.94 MB)
+
+
+================================================================================
+3. SYSTEM ARCHITECTURE
+================================================================================
+ Tasks / contexts
+   - Arduino loop() task : safety loop, web server handleClient(), SD logging,
+                           RTC resync, hoist reading.
+   - BLE (Bluedroid) task: runs the GATT callbacks (onConnect, onDisconnect,
+                           AuthCallbacks, DigitalCallbacks, HeartbeatCallbacks).
+   - Wi-Fi / lwIP tasks  : handled by the SDK.
+
+ Cross-task rules (important design points)
+   1. i2cMutex serialises ALL I2C access (RTC + MCP23017 I/O) because the
+      Wire object is not thread safe and both the BLE task and loop() use it.
+        I2CGuard     : blocking lock (portMAX_DELAY) for normal calls.
+        TryI2CGuard  : bounded lock (20 ms) for the safety-critical per-cycle
+                       I/O (updateEstopState, updateOutputPinsFromState,
+                       applyOutputsDisconnected). If the bus is busy, that
+                       cycle is skipped and the last known state held, so a
+                       stuck RTC transaction can never freeze the safety loop
+                       or fake a heartbeat timeout.
+   2. SD writes happen ONLY from loop(). BLE callbacks just set
+      pendingLoginEvent / pendingLogoutEvent flags; loop() drains them.
+   3. BLE callbacks are wrapped in try/catch(...) so a std::bad_alloc under
+      low heap cannot abort() the whole controller.
+
+ Global state (main.cpp)
+   motionEstop, motionUp/Down/Left/Right : final gated motion state
+   mobileEstopSignal      : latched "stop requested" flag (app + interlock)
+   estopInputHigh         : live level of the interlock input
+   deviceConnected / authenticated / connectedUserEmail / connId
+   lastHeartbeatTime / heartbeatAlive / heartbeatMissCount
+   users[], userCount, devices[], deviceCount
+   pinMotionConfig[], inputMode[], hoistConfig, hoistOneInputIdx,
+   hoistTwoInputIdx, remoteInputIdx
+   bleName, wifiSsid, wifiPassword
+
+
+================================================================================
+4. SAFETY LOGIC
+================================================================================
+ 4.1 E-STOP polarity
+   The E-STOP output is "inverted / fail-safe":
+        motionEstop == true   -> E-STOP output LOW  (relay de-energised, crane
+                                 stopped)
+        motionEstop == false  -> E-STOP output HIGH (relay energised, crane
+                                 allowed to run)
+   All other motion outputs are normal: HIGH = active, LOW = inactive.
+
+ 4.2 Two-step interlock (updateEstopState, called every loop cycle)
+   motionEstop = !( mobileEstopSignal == false  AND  interlockInput == HIGH )
+
+   - interlockInput is the physical input chosen by remoteInputIdx
+     (default I0.1). If no pin is assigned (-1) it fails safe (treated as
+     open = stopped).
+   - mobileEstopSignal latches TRUE on:
+        * FALLING EDGE of the interlock input (HIGH -> LOW),
+        * app sending estop = 1,
+        * BLE disconnect,
+        * heartbeat loss (10 s),
+        * forceAllOutputsOff() (boot, OTA start).
+   - It is cleared ONLY by the app sending a fresh estop = 0. The interlock
+     input returning HIGH on its own never restarts the machine.
+   - Edge case: if the app clears E-STOP while the interlock input is still
+     LOW (no edge occurred), the clear is kept and the relay turns on as soon
+     as the input goes HIGH.
+
+ 4.3 Directional outputs (updateOutputPinsFromState)
+   UP / DOWN / LEFT / RIGHT outputs are ON only when ALL are true:
+        - BLE connected, AND authenticated,
+        - heartbeat healthy (last heartbeat <= 10 s ago),
+        - motionEstop == false,
+        - the matching motion flag is set by the app command.
+   Other behaviour:
+        - not connected      -> all outputs LOW (E-STOP follows motionEstop)
+        - connected, not yet authenticated -> directional outputs LOW,
+          E-STOP pin untouched
+
+ 4.4 Command conflict protection
+   UP + DOWN both set    -> both forced OFF.
+   LEFT + RIGHT both set -> both forced OFF.
+
+ 4.5 Heartbeat supervision (in loop)
+   HEARTBEAT_TIMEOUT_MS = 10 000 ms, steps of 2 000 ms.
+   Missed-count logs at >2 s, >4 s, >6 s, >8 s; at >10 s (count 5) the
+   firmware sets heartbeatAlive = false, latches mobileEstopSignal = true
+   (reason "Heartbeat lost") and updates E-STOP.
+   When a heartbeat arrives again, heartbeatAlive is restored but the app
+   must still send estop = 0 to clear the latched E-STOP.
+
+ 4.6 BLE disconnect
+   onDisconnect(): UP/DOWN/LEFT/RIGHT = false, mobileEstopSignal = true
+   (reason "App disconnected"), outputs updated immediately, advertising
+   restarted. A logout event is queued if the user was authenticated.
+
+ 4.7 Authentication timeout
+   If a client is connected but not authenticated for 60 s (AUTH_TIMEOUT_MS)
+   the PLC sends "AUTH_TIMEOUT" and disconnects it.
+
+ 4.8 Timed-user window enforcement
+   Once per second, an authenticated timed user is re-checked. If the access
+   window has ended the PLC sends encrypted "AUTH_FAIL:OUT_OF_TIME" and
+   disconnects (which also trips E-STOP).
+
+ 4.9 Boot state
+   At boot all outputs are LOW and forceAllOutputsOff() latches E-STOP, so the
+   machine is always stopped after power-up until the app clears it.
+
+ 4.10 Reason tracking
+   estopChangeReason records why the E-STOP changed (e.g. "I0.1 interlock
+   opened", "App E-STOP command by x@y", "App cleared E-STOP by x@y",
+   "App disconnected", "Heartbeat lost", "boot"). It is written to the SD log.
+
+
+================================================================================
+5. BLUETOOTH LE INTERFACE
+================================================================================
+ Device name   : bleName (default "RRC_PLC", configurable, must start "RRC_")
+ Advertising   : manufacturer data "PLC14" + Service UUID
+ Connection    : min/max interval 0x06 (7.5 ms), latency 0, timeout 400
+ Service UUID  : 6e400001-b5a3-f393-e0a9-e50e24dcca9e   (24 handles)
+
+ +---------------+----------------------------------------+-----------------+
+ | Name          | UUID                                   | Properties      |
+ +---------------+----------------------------------------+-----------------+
+ | ANALOG        | 6e400002-b5a3-f393-e0a9-e50e24dcca9e   | NOTIFY          |
+ | DIGITAL       | 6e400003-b5a3-f393-e0a9-e50e24dcca9e   | WRITE (no resp) |
+ | AUTH          | 6e400004-b5a3-f393-e0a9-e50e24dcca9e   | WRITE + NOTIFY  |
+ | STATUS        | 6e400005-b5a3-f393-e0a9-e50e24dcca9e   | NOTIFY          |
+ | HEARTBEAT     | 6e400006-b5a3-f393-e0a9-e50e24dcca9e   | WRITE (no resp) |
+ +---------------+----------------------------------------+-----------------+
+ (Notify characteristics carry a BLE2902 descriptor - CCCD - so the app must
+  enable notifications.)
+
+ 5.1 AUTH characteristic (…0004…)  - Write + Notify
+   Purpose: login handshake.
+   PLC -> App (notify):
+        * on connect (PLAIN TEXT): "AUTH_REQ:email|password|deviceid"
+        * encrypted replies: "AUTH_OK| <Role>" (e.g. "AUTH_OK| Admin"), "AUTH_FAIL",
+          "AUTH_FAIL:OUT_OF_TIME", "AUTH_FAIL:UNTRUSTED_DEVICE"
+        * also later "AUTH_FAIL:OUT_OF_TIME" (encrypted) when a timed user's
+          window closes during a session
+        * "AUTH_TIMEOUT" (plain) after 60 s without login
+   App -> PLC (write): encrypted "email|password|deviceid".
+
+ 5.2 DIGITAL characteristic (…0003…)  - Write without response
+   Purpose: motion commands from the app.
+   App -> PLC: encrypted CSV "estop,up,down,left,right"
+        e.g. "0,1,0,0,0" (also accepted with brackets "[0,1,0,0,0]").
+   Ignored unless authenticated.
+   Effects:
+        estop=1 : mobileEstopSignal = true, all directional motions OFF
+        estop=0 : mobileEstopSignal = false, directions follow up/down/left/
+                  right (after the conflict rules), then actual relay state is
+                  decided by updateEstopState() + updateOutputPinsFromState().
+
+ 5.3 HEARTBEAT characteristic (…0006…)  - Write without response
+   Purpose: keep-alive from the app.
+   App -> PLC: encrypted text "HB". Ignored unless authenticated.
+   Each valid heartbeat sets lastHeartbeatTime = now, clears the miss count
+   and restores heartbeatAlive. Recommended send rate: faster than every 2 s
+   (timeout is 10 s).
+
+ 5.4 STATUS characteristic (…0005…)  - Notify
+   Purpose: PLC tells the app the E-STOP / motion state.
+   PLC -> App: encrypted CSV "estop,up,down,left,right"
+        estop field = mobileEstopSignal (1 = stop requested/latched,
+        0 = cleared) - the app's request combined with any interlock trip -
+        not a readback of the output pin.
+   Sent:
+        - right after a successful login,
+        - whenever mobileEstopSignal changes (including physical interlock
+          trips with no app involvement).
+   The app treats every status notification as an encrypted frame
+   (IV|CIPHER|TAG, min 28 bytes).
+
+ 5.5 ANALOG characteristic (…0002…)  - Notify
+   Purpose: hoist (analog) values to the app.
+   PLC -> App: encrypted text "H1,<val>" / "H2,<val>" /
+        "H1,<val>,H2,<val>" depending on hoist mode.
+   Function notifyHoistValues() exists and implements this, BUT its call
+   inside printHoistValues() is currently commented out ("//notifyHoistValues();"),
+   so at present hoist values are only printed on the Serial monitor and are
+   not transmitted to the app. Re-enabling that call activates the
+   characteristic.
+
+
+================================================================================
+6. BLE SECURITY (AES-GCM)
+================================================================================
+ Algorithm : AES-128-GCM (mbedTLS), pre-shared 16-byte key compiled into the
+             firmware (aesKey). Key bytes in ASCII: "TUSKER_RRC_DEV_1".
+ Packet    : IV (12 bytes) | CIPHERTEXT (n bytes) | TAG (16 bytes)
+ Encoding  : sent as HEX text (e.g. "A1B2...") OR raw bytes. The PLC accepts
+             either (decodePayload tries hex text first, then hex of raw
+             bytes, then raw bytes). Replies from the PLC are always HEX text
+             (uppercase).
+ Minimum   : 28 bytes (12 + 16) with empty plaintext.
+ Maximum   : PLC encrypts plaintext up to 200 bytes.
+
+ IV layout used by the APP (for replay protection)
+        bytes 0-5  : Session ID   (48-bit big endian)
+        bytes 6-11 : Counter      (48-bit big endian)
+   The PLC keeps up to 8 session entries (sessionCounters). A packet is
+   accepted only if its counter is STRICTLY GREATER than the last accepted
+   counter for that session ID. Unknown session IDs are accepted (counter
+   table updated). When the table is full the entry with the lowest counter
+   is replaced. The counter is stored only after successful decryption /
+   tag verification. Replayed or stale packets are dropped.
+
+ IV used by the PLC for replies
+   A 12-byte big-endian counter (replyIvCounter) that is incremented before
+   every encrypted reply. It starts at zero on every reboot.
+
+ No AAD (additional data) is used.
+ The same key and scheme apply to AUTH, DIGITAL, HEARTBEAT writes and to
+ AUTH replies, STATUS and ANALOG notifications.
+ NOTE: the initial "AUTH_REQ:..." prompt sent on connect is plain text.
+
+
+================================================================================
+7. BLE AUTHENTICATION SEQUENCE
+================================================================================
+  App                                            PLC
+   |---- connect ---------------------------------->|  onConnect: authenticated=false
+   |<--- notify AUTH: "AUTH_REQ:email|password|deviceid" (plain)
+   |                                                |
+   |---- write AUTH: Enc("email|password|deviceid")->|
+   |                                                |  decode -> counter check ->
+   |                                                |  AES-GCM decrypt ->
+   |                                                |  split on '|' ->
+   |                                                |  checkCredentials()
+   |                                                |  isUserAccessAllowed()
+   |                                                |  isDeviceRegistered()
+   |<--- notify AUTH: Enc("AUTH_OK| <Role>" | "AUTH_FAIL" |
+   |         "AUTH_FAIL:OUT_OF_TIME" | "AUTH_FAIL:UNTRUSTED_DEVICE")
+   |<--- notify STATUS: Enc("1,0,0,0,0")   (only after AUTH_OK)
+   |                                                |
+   |---- write HEARTBEAT: Enc("HB") periodically -->|
+   |---- write DIGITAL: Enc("0,1,0,0,0") ---------->|
+   |<--- notify STATUS on any E-STOP change ---------|
+
+ Login succeeds only if ALL three are true:
+   1. Credentials valid (okCreds)
+   2. User allowed at this time (okTime - perpetual, or inside timed window
+      and RTC clock available)
+   3. Device ID registered in the Device Registry (okDevice, 1-40 chars)
+
+ Reply selection:
+   all OK                         -> AUTH_OK| Admin  or  AUTH_OK| Operator
+   creds ok, time not allowed     -> AUTH_FAIL:OUT_OF_TIME
+   creds ok, device unregistered  -> AUTH_FAIL:UNTRUSTED_DEVICE
+   anything else                  -> AUTH_FAIL
+
+ There are no special password values: login succeeds only when the email
+ matches a stored user exactly and the password equals that user's stored
+ password (the former "FC_OK" bypass / "FC_NOK" refusal were removed).
+
+ Email comparison for BLE login is exact (case sensitive: email == users[i].email).
+ Web login and web user lookups are case-insensitive.
+
+ Failure paths that also send an encrypted "AUTH_FAIL": payload decode
+ failure, too-short packet, replayed/stale counter, GCM decrypt failure, bad
+ format (not email|password|deviceid).
+
+ On success:
+   - authenticated = true, connectedUserEmail stored
+   - a LOGIN event is queued ("<name> (<email>) logged in from device <id>")
+   - the current E-STOP state is pushed to the app.
+ On disconnect: LOGOUT event queued ("<name> (<email>) logged out").
+
+
+================================================================================
+8. DATA FORMATS - QUICK REFERENCE
+================================================================================
+ Direction   Characteristic  Plaintext content                  Encrypted?
+ ---------   --------------  ---------------------------------  ----------
+ PLC->App    AUTH            AUTH_REQ:email|password|deviceid   No
+ App->PLC    AUTH            email|password|deviceid            Yes
+ PLC->App    AUTH            AUTH_OK| <Role> / AUTH_FAIL[:reason]       Yes
+ PLC->App    AUTH            AUTH_TIMEOUT                       No
+ App->PLC    DIGITAL         estop,up,down,left,right  (0/1)    Yes
+ PLC->App    STATUS          estop,up,down,left,right  (0/1)    Yes
+ App->PLC    HEARTBEAT       HB                                 Yes
+ PLC->App    ANALOG          H1,<v> | H2,<v> | H1,<v>,H2,<v>    Yes (currently
+                                                                not sent)
+
+ Examples
+   Move UP         : "0,1,0,0,0"
+   Move RIGHT      : "0,0,0,0,1"
+   Emergency stop  : "1,0,0,0,0"
+   Clear E-STOP idle: "0,0,0,0,0"
+
+ Status "1,0,0,0,0" after login = E-STOP is latched; the app must send a
+ command with estop=0 to enable the crane (and the interlock input must be
+ HIGH).
+
+
+================================================================================
+9. INPUT AND OUTPUT CONFIGURATION
+================================================================================
+ 9.1 Output mapping (web: Output Config)
+   Each of the 5 physical outputs (R0_0, Q0_0..Q0_3) has:
+        function : DF1..DF5   (unique per output)
+        motion   : None / E-STOP / UP / DOWN / LEFT / RIGHT
+                   (each non-None motion may be assigned to only ONE output)
+   Defaults:
+        R0_0 -> DF1 -> E-STOP
+        Q0_0 -> DF2 -> UP
+        Q0_1 -> DF3 -> DOWN
+        Q0_2 -> DF4 -> LEFT
+        Q0_3 -> DF5 -> RIGHT
+   Duplicates are rejected (HTTP 400 JSON or redirect with err=dup).
+   Saved in NVS and applied immediately (applyOutputConfig).
+   Output level rules: E-STOP -> LOW when active; others -> HIGH when active;
+   "None" outputs stay LOW.
+
+ 9.2 Input configuration (web: Input Config)
+   - I0.7 and I0.8 can each be set to Digital or Analog mode.
+       Digital : GPIO32 / GPIO33
+       Analog  : GPIO34 / GPIO35 (labels A0.7 / A0.8)
+   - Hoist 1 / Hoist 2 input source - choose which input feeds each hoist
+     (shown only for enabled hoists).
+   - Remote (E-STOP interlock) input - choose which input acts as the
+     mobile-remote interlock (default I0.1; may be "none", which fails safe).
+   - Saved in NVS namespace "inconfig"; pins re-initialised (applyInputConfig).
+
+ 9.3 Hoist mode (hoistConfig)
+   HOIST_NONE (0), HOIST_ONE (1), HOIST_TWO (2), HOIST_BOTH (3).
+   Stored in NVS "hoistconfig". Loaded at boot (loadHoistConfig).
+
+
+================================================================================
+10. HOIST (ANALOG) HANDLING
+================================================================================
+ printHoistValues() runs every loop but acts every 500 ms:
+   - For each enabled hoist, reads the assigned input.
+   - Analog input : analogRead() then scaleHoistAnalogValue():
+         raw <= 800  -> 0
+         raw >= 4095 -> 5000
+         otherwise   -> (raw - 800) * 5000 / (4095 - 800)   (linear)
+   - Digital input: digitalRead() value (0 or 1).
+   - No input assigned: value 0.
+   - Raw count and scaled value are printed to Serial:
+        "Hoist1 [A0.7, Analog]: raw=... scaled=..."
+   - The values are stored in hoistA1Value / hoistA2Value.
+   - notifyHoistValues() formats "H1,<int>" etc., encrypts it and notifies on
+     the ANALOG characteristic - but the call is currently commented out.
+
+
+================================================================================
+11. USER MANAGEMENT AND ACCESS CONTROL
+================================================================================
+ User record: name, email, password, role, accessType, startTs, endTs.
+ Capacity   : MAX_USERS = 30.
+ Roles      : Admin, Operator.
+ Access type:
+        Perpetual : may log in at any time.
+        Timed     : only while startTs <= RTC time < endTs (RTC time is
+                    treated as literal wall-clock, no time zone). If the
+                    clock has never been read, a timed user is DENIED.
+ Default user: if no Admin exists after loading, "Admin" /
+               admin@plc.com / admin123 (Perpetual) is created automatically.
+ Old firmware records without access fields are loaded as Perpetual; empty
+ name falls back to email; empty role falls back to Operator.
+
+ Admin web functions (Users tab): Add, Edit, Delete (with confirmation page),
+ "Login As" (admin switches web session to a user and is exempt from the
+ timed window).
+ Validation: name/email/password required on add; email must be unique
+ (case-insensitive); reserved passwords refused; timed users need both From
+ and To (To must be after From).
+
+ Roles (3 levels)
+   Super Admin : the web-admin account (NVS "webadmin", default
+                 superadmin@plc.com). Single account, NOT in users[], NO BLE
+                 app access. Full web access. The only role that can add,
+                 edit, delete or "Login As" Admin accounts, and the only one
+                 that can create Admins.
+   Admin       : stored user (role "Admin"), BLE app + full web access.
+                 Can add/edit/delete/"Login As" Operators ONLY. Admin rows
+                 are shown read-only ("Super Admin only") and the server
+                 rejects any attempt to create/assign the Admin role (403).
+   Operator    : stored user (role "Operator"), BLE app + limited web access
+                 (unchanged).
+ BLE login additionally refuses any user whose stored role is "SuperAdmin";
+ unknown stored roles are loaded as Operator.
+
+ Role permissions (web)
+   Home                        : Super Admin, Admin, Operator
+   Output Config / Input Config /
+   Network Settings / Time & Date : Super Admin, Admin, Operator
+   User Management / Device Registry /
+   Firmware Update / Files      : Super Admin, Admin
+   Account Settings             : any logged-in user
+
+
+================================================================================
+12. DEVICE REGISTRY
+================================================================================
+ Up to 20 mobile device IDs (max 40 chars each, optional owner e-mail).
+ BLE login is refused ("AUTH_FAIL:UNTRUSTED_DEVICE") unless the app's device
+ ID is in this list. Managed by an Admin on the "Device Registry" tab (add,
+ delete). Duplicate IDs are rejected. Stored in NVS namespace "devices".
+ Helper functions: loadDevices, saveDevices, isDeviceRegistered,
+ registerDevice, unregisterDevice.
+
+
+================================================================================
+13. WI-FI ACCESS POINT AND WEB PANEL
+================================================================================
+ Mode      : Access Point only (WIFI_AP).
+ Default   : SSID "RRC_PLC", password "12345678"
+ URL       : http://192.168.4.1/  (softAP IP, printed to Serial at boot)
+ Server    : ESP32 WebServer on port 80, handled from loop().
+ Constraints on edit: SSID 5-10 chars; password 8-10 chars; BLE name must
+ start with "RRC_" and be 5-10 chars.
+
+
+================================================================================
+14. WEB PANEL PAGES AND HTTP ROUTES
+================================================================================
+ Single-page style dashboard with a left sidebar. Tab switching uses
+ fetch() to load only the tab fragment (/?tab=X&frag=1) instead of a full page
+ reload, to avoid exhausting the ESP32's few TCP sockets. Responses are
+ streamed in ~4 KB chunks.
+
+ Tabs
+   home        : BLE connection state (Not Connected / Authenticating /
+                 Connected + user name) and Motion Status tags
+                 (E-STOP, UP, DOWN, LEFT, RIGHT). Updated live by polling
+                 /motion/status.
+   users       : (Admin) user table, add / edit / delete / login-as.
+   devices     : (Admin) registered phones.
+   ota         : (Admin) firmware upload form, shows FIRMWARE_VERSION.
+   files       : (Admin) SD card file list with size and log entry count,
+                 download / view-edit / delete / new file.
+   outconfig   : output function & motion mapping.
+   inconfig    : I0.7/I0.8 mode, hoist inputs, remote interlock input.
+   network     : BLE name, Wi-Fi SSID and password.
+   time        : device date and time (RTC) + current time display.
+   (account page: change own name/password; logout from the user menu)
+
+ Routes (webServer.on)
+   GET  /style.css          shared stylesheet (cached by browser)
+   GET  /login              login page
+   POST /login              login (web admin or user email+password)
+   GET  /logout             end session
+   GET  /                   dashboard (?tab=, &frag=1 for AJAX fragment)
+   GET  /add   POST /add    add user (Admin)
+   GET  /edit  POST /edit   edit user (Admin)
+   GET  /confirm-delete     delete confirmation (Admin)
+   POST /delete             delete user (Admin)
+   GET  /account            account settings page
+   POST /account            change own name/password
+   GET  /login-as?idx=      Admin impersonates a user
+   GET  /motion/status      JSON status (used by Home live update)
+   POST /outconfig          save output mapping (supports fetch -> JSON)
+   POST /inconfig           save input / hoist / remote config
+   POST /netconfig          save BLE/Wi-Fi names, then reboot
+   POST /timeconfig         set RTC date/time
+   POST /devices            add device (Admin)
+   POST /devices/delete     delete device (Admin)
+   POST /ota                firmware upload (Admin)
+   GET  /files/download?name=      download file (Admin)
+   GET  /files/edit?name=          view/edit file (Admin)
+   POST /files/save                save file (Admin)
+   GET  /files/confirm-delete      delete confirmation (Admin)
+   POST /files/delete              delete file (Admin)
+   POST /files/new                 create file (Admin)
+
+ /motion/status JSON
+   {"estop":0|1,"up":..,"down":..,"left":..,"right":..,
+    "ble_conn":0|1,"ble_auth":0|1,"ble_user":"<name>"}
+   Values follow the pin-motion config. Note: for "estop" the web reports
+   1 when the E-STOP output is ENERGISED/ON (i.e. motionEstop == false),
+   per the code (estopOutputOn = motionEstop ? 0 : 1).
+
+ Files tab details
+   - Operates on the SD root only; names validated (no path separators,
+     no leading '.', forbidden FAT characters, <= 60 chars).
+   - Editable if file <= 4096 bytes; larger files are read-only and show only
+     the last 16384 bytes. Download gives the full file.
+   - Line (entry) count is computed only for files <= 262144 bytes.
+   - New files get ".txt" appended if no extension is given.
+
+ Account page
+   - BLE-user: change display name and password (current password required;
+     new password >= 6 chars; reserved passwords refused).
+   - Web admin: change login e-mail/username and password; session is
+     invalidated afterwards so the admin must log in again.
+
+
+================================================================================
+15. WEB SECURITY AND SESSION HANDLING
+================================================================================
+ - Cookie session: "session=<32 hex chars>; HttpOnly; Path=/".
+ - Up to 5 simultaneous sessions (MAX_SESSIONS); when full the oldest slot is
+   evicted round-robin.
+ - Web admin account (separate from BLE users), stored in NVS "webadmin":
+        default  superadmin@plc.com / superadmin123
+   (Old plain-username values are migrated to the e-mail default.)
+ - BLE users can also log into the web panel using their e-mail + password;
+   they get their stored role.
+ - A timed user's web session ends automatically (redirect to
+   /login?timeout=1) when the access window closes. Web admin and
+   "Login As" sessions are exempt.
+ - Admin-only routes use webAuthAdmin(); config routes use
+   webAuthOutputConfig() (Admin or Operator).
+ - HTML output of file names is escaped (htmlEsc) and URL-encoded where needed.
+ - sendSafe(): times every response write; if a write takes > 300 ms the
+   client is considered dead and the socket is force-closed, preventing zombie
+   connections from blocking the single-threaded web server.
+ - Note: the web panel is plain HTTP (no TLS), and passwords are stored in
+   plain text in NVS.
+
+
+================================================================================
+16. RTC, SOFTWARE CLOCK AND TIME & DATE
+================================================================================
+ RTC: DS3231M on the RTC 10 Click, I2C 0x68, driver in lib/rtc10 (a Wire port
+ of the MikroElektronika driver; the original mikroSDK files in
+ lib/"RTC 10 Click" are not used for the build).
+ Driver functions: rtc10_init, rtc10_setTime/getTime, rtc10_setDate/getDate,
+ rtc10_read_byte/write_byte, rtc10_lost_power / rtc10_clear_lost_power
+ (OSF flag), rtc10_clear_read_error / rtc10_had_read_error,
+ rtc10_get_temperature.
+
+ Boot behaviour
+   - I2C bus recovery (recoverI2CBus): if SDA is stuck low, SCL is clocked up
+     to 9 times and a STOP condition is issued.
+   - If the RTC lost power, it is set to the firmware COMPILE date/time.
+   - syncTimeCache() primes the software clock.
+
+ Software clock cache
+   currentTimestamp() never reads I2C directly. It returns the cached RTC
+   reading plus elapsed millis(). loop() refreshes the cache every 2 s
+   (syncTimeCache). Each read is range checked and retried up to 3 times
+   within an 80 ms budget to reject corrupted values. After 3 consecutive
+   failed periodic syncs the periodic resync is abandoned for the session.
+   If no reading has ever succeeded, the timestamp is "N/A".
+   Time zone: none (UTC / literal wall-clock).
+
+ Time & Date page
+   Sets the RTC (setRtcDateTime): writes date and time, then reads back and
+   verifies (date/time match, seconds within +/-3 s, up to 3 attempts). If the
+   write does not verify, an error page explains a likely wiring/pull-up
+   problem. On success the cache is refreshed immediately.
+
+
+================================================================================
+17. SD CARD EVENT LOGGING
+================================================================================
+ Optional - if the card is missing, events are only printed on Serial.
+ Files   : one per month, "/events_YYYY-MM.log" (month taken from the event's
+           own timestamp); events without a valid time go to
+           "/events_undated.log".
+ Format  : CSV line  "YYYY-MM-DD HH:MM:SS,CATEGORY,detail"
+ The file is opened in append mode, written and closed on every event (no data
+ loss on power cut; a re-inserted card is picked up on the next write).
+ SD.open() exceptions (low heap) are caught and the entry is skipped.
+
+ Event categories
+   LOGIN       "<name> (<email>) logged in from device <deviceId>"
+   LOGOUT      "<name> (<email>) logged out"
+   CRANE_START E-STOP output went HIGH (motionEstop false) + reason
+   CRANE_STOP  E-STOP output went LOW  (motionEstop true)  + reason
+   (reasons: boot, "I0.1 interlock opened", "App E-STOP command by ...",
+    "App cleared E-STOP by ...", "App disconnected", "Heartbeat lost")
+
+ Logs can be downloaded, viewed (last 16 KB) or deleted from the web
+ "Files" tab.
+
+
+================================================================================
+18. PERSISTENT STORAGE (NVS / Preferences)
+================================================================================
+ Namespace    Keys                                   Content
+ -----------  -------------------------------------  -------------------------
+ bleusers     count; u_i = one string per user       BLE/web users
+              (name,email,pass,role,acc,start,end
+              joined by 0x1F; old email_i... keys migrate)
+ outconfig    pin_i_function, pin_i_motion           Output mapping
+ inconfig     mode_i, hoist1_in, hoist2_in,          Input modes, hoist
+              remote_in                              inputs, interlock input
+ hoistconfig  mode                                   Hoist enable mode
+ netconfig    wifi_ssid, wifi_password, ble_name     Network names
+ devices      count, dev_i, owner_i                  Device registry
+ webadmin     user, pass                             Web admin credentials
+
+ Defaults are applied when keys are missing/invalid, and values are
+ clamped to valid ranges at load time. The partition table keeps the NVS
+ offset/size unchanged so settings survive firmware updates.
+
+
+================================================================================
+19. OTA FIRMWARE UPDATE
+================================================================================
+ - Admin only: Firmware Update tab -> upload .bin via POST /ota.
+ - Authorization is checked at UPLOAD_FILE_START and gates every Update.write().
+ - Before flashing begins, forceAllOutputsOff() puts the machine in safe state.
+ - Update.begin(UPDATE_SIZE_UNKNOWN) -> Update.write chunks -> Update.end(true).
+ - Dual-slot layout: the new image is written to the INACTIVE slot and only
+   becomes bootable after a full verified write; a failed update leaves the
+   previous firmware intact.
+ - On success the page reports completion and the device restarts after 0.5 s.
+ - Errors reported: not authorised, could not start (image too large), write
+   failed, upload aborted, did not verify.
+ - Each slot is about 1.94 MB (current firmware is about 1.7 MB).
+
+
+================================================================================
+20. NETWORK SETTINGS
+================================================================================
+ Network tab (Admin / Operator) edits:
+   - BLE name        (must start "RRC_", 5-10 chars)
+   - Wi-Fi SSID      (5-10 chars)
+   - Wi-Fi password  (8-10 chars)
+ Values are saved to NVS and the device restarts so the new AP and BLE name
+ take effect. After reboot, reconnect to the new SSID.
+
+
+================================================================================
+21. ROBUSTNESS / STABILITY MEASURES
+================================================================================
+ - I2C mutex + bounded safety-loop locks (section 3).
+ - Wire clock 50 kHz and 20 ms timeout; boot-time I2C bus recovery.
+ - RTC reads are validated, retried and cached; RTC/SD are optional and never
+   halt the PLC.
+ - try/catch around BLE callbacks and SD.open to survive std::bad_alloc.
+ - Wi-Fi driver log tag silenced (esp_log_level_set("wifi", NONE)) to avoid a
+   known abort in the Wi-Fi logger under low heap.
+ - Classic Bluetooth memory released (~70 KB extra heap).
+ - Web: chunked responses, fragment-based tab loading, dead-socket detection.
+ - Safe defaults: E-STOP latched at boot; fails safe if the interlock input is
+   unassigned.
+ - Fast BLE connection interval (7.5 ms) for low latency.
+
+
+================================================================================
+22. BOOT SEQUENCE (setup) AND MAIN LOOP
+================================================================================
+ setup()
+   1. Serial init, print firmware version, silence Wi-Fi log tag.
+   2. Create i2cMutex.
+   3. I2C bus recovery, Wire.begin, 50 kHz, timeout 20 ms.
+   4. RTC init (set from compile time if power was lost), prime time cache.
+   5. SD.begin(CS=5) -> sdOk.
+   6. loadUsers (creates default admin if needed), loadOutputConfig,
+      loadHoistConfig, loadInputConfig.
+   7. Configure Q0_0..Q0_3 as outputs, S0..S3_24v as outputs set HIGH, all
+      configured outputs LOW.
+   8. loadNetworkConfig, forceAllOutputsOff.
+   9. Start Wi-Fi AP, register web routes (setupWebRoutes).
+  10. Release classic-BT memory, BLEDevice::init(bleName), create server,
+      service and the 5 characteristics with callbacks, start advertising.
+
+ loop()  (every ~20 ms)
+   1. updateEstopState()      - sample interlock, compute motionEstop.
+   2. If BLE connected:
+        - 60 s auth timeout check,
+        - once/second timed-user window check,
+        - heartbeat miss counting and 10 s E-STOP trip,
+        - updateOutputPinsFromState().
+      Else: clear motions, applyOutputsDisconnected().
+   3. If mobileEstopSignal changed -> notifyMotionStatus().
+   4. If motionEstop changed -> log CRANE_START / CRANE_STOP to SD.
+   5. Drain pending LOGIN / LOGOUT events to SD.
+   6. printHoistValues() (every 500 ms).
+   7. Every 2 s refresh software clock from RTC.
+   8. webServer.handleClient().
+   9. delay(20).
+
+
+================================================================================
+23. DEFAULT CREDENTIALS AND LIMITS
+================================================================================
+ Default values
+   Wi-Fi SSID / password  : RRC_PLC / 12345678
+   BLE name               : RRC_PLC
+   Web admin              : superadmin@plc.com / superadmin123
+   Default BLE/web Admin  : admin@plc.com / admin123
+   Interlock input        : I0.1
+ (CHANGE ALL DEFAULTS before deploying.)
+
+ Limits
+   Users            : 30        Registered devices : 20
+   Web sessions     : 5         Session-counter table: 8 sessions
+   Heartbeat timeout: 10 s      Auth timeout       : 60 s
+   Hoist scaling    : raw 800-4095 -> 0-5000
+   File edit limit  : 4096 B    File view tail     : 16384 B
+   Device ID length : 1-40      Reply plaintext max: 200 bytes
+   Password (web account change): min 6 chars
+
+
+================================================================================
+24. BUILD AND FLASH
+================================================================================
+ platformio.ini
+   [env:board]
+   platform  = Industrial-Shields/platform-industrialshields-esp32
+   board     = 14iosplc_ma, custom_version = 4
+   framework = arduino
+   monitor_speed = 115200
+   board_build.partitions = partitions.csv
+   lib_deps = SPI, SD
+ Steps
+   1. Open the folder in VS Code with PlatformIO.
+   2. Build (PlatformIO: Build) - first build downloads the Industrial Shields
+      platform/framework.
+   3. Upload over USB for the first flash (partitions.csv must be applied).
+   4. Later updates can be done from the web panel (Firmware Update) using
+      the generated firmware .bin (.pio/build/board/firmware.bin).
+   5. Monitor at 115200 baud for logs ([EVENT] lines, auth, heartbeat, etc.).
+
+
+================================================================================
+25. NOTES / OBSERVATIONS (from code review)
+================================================================================
+ - Hoist values are read and printed but NOT yet sent over BLE
+   (notifyHoistValues() call is commented out).
+ - Firmware boot-time input/output pin configuration comments mention "9
+   inputs"; the code uses NUM_INPUT_PINS = 9.
+ - loadNetworkConfig() requires SSID/BLE name length >= 6 when loading from
+   NVS, while the web form accepts 5-10 characters; a 5-character value
+   would be saved but replaced by the default after reboot.
+ - saveOutputConfig() writes keys "pin_i_function"/"pin_i_motion", while
+   loadOutputConfig() reads "pin_i_function" and first "func_i_motion",
+   falling back to "pin_i_motion" - consistent result, legacy key kept.
+ - The AES key and default passwords are
+   compiled in / stored in plain text; treat the unit as needing a trusted
+   network and protect the firmware image.
+ - The initial AUTH_REQ prompt is unencrypted; everything after is encrypted.
+ - In the Home panel's server-rendered first paint, the E-STOP tag is shown
+   when motionEstop is false, matching the polarity convention described in
+   section 14 (the live JSON uses the same convention).
+================================================================================
+ END OF DOCUMENT
+================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

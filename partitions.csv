@@ -1,0 +1,19 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Dual-slot OTA layout for this board's 4MB flash. Replaces the stock
+# huge_app.csv single-slot scheme so a web-based firmware update always
+# writes to the INACTIVE app slot and can only be promoted to boot after a
+# full, verified write - a failed/interrupted update falls back to the
+# still-intact previous firmware instead of leaving the device unbootable.
+# nvs/otadata keep the same offsets/sizes as huge_app.csv, so existing NVS
+# data (users, I/O config, etc.) survives the switch to this table.
+# IMPORTANT: ota_0 must stay at 0x10000 and otadata at 0xe000. The Industrial
+# Shields PlatformIO upload step writes the firmware to 0x10000 and
+# boot_app0.bin to 0xe000 (hardcoded), so moving them leaves the board with
+# no bootable app (blank serial, no BLE/Wi-Fi).
+# The unused "spiffs" partition from huge_app.csv (nothing in this project
+# uses SPIFFS/LittleFS) is reclaimed to make room for the second app slot;
+# each slot is ~1.94MB, comfortably above the current ~1.7MB firmware size.
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+ota_0,    app,  ota_0,   0x10000, 0x1F0000,
+ota_1,    app,  ota_1,   0x200000,0x1F0000,
